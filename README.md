@@ -153,9 +153,9 @@ changes behavior.
 | axis | how husk handles it |
 |---|---|
 | **Correctness / isolation** | Store entries are keyed by lockfile hash, so a branch with a different lockfile can never silently get the wrong deps. Default `clone` mode gives fully private writes. A worktree whose lockfile changed is *refused* sharing until deps are reinstalled (`--install`) or explicitly trusted (`adopt`). |
-| **Concurrency / write contention** | Store seeding is serialized by a portable lock with atomic rename: 100 parallel `husk link` calls produce exactly one entry, and no partial tree is ever visible. Provisioning from an existing entry is lock-free. In `symlink` mode the entry root is made read-only, so direct writes fail loudly (EACCES). An accidental `npm install` can't poison siblings either: npm replaces the symlink with a fresh private dir (correct results, sharing silently lost, and `husk status` flags it as `not-a-link`). |
+| **Concurrency / write contention** | Store seeding is serialized by a portable lock with atomic rename: 100 parallel `husk link` calls produce exactly one entry, and no partial tree is ever visible. The same lock serializes `--install`, so 100 agents hitting a fresh lockfile run **one** installer while 99 wait and reuse the result. Interrupted commands clean up after themselves (held locks and half-built temp dirs are released on exit), a killed process's lock is stolen once its pid is gone, and `husk doctor --fix` sweeps any residue that survives a hard kill. Provisioning from an existing entry is lock-free. In `symlink` mode the entry root is made read-only, so direct writes fail loudly (EACCES). An accidental `npm install` can't poison siblings either: npm replaces the symlink with a fresh private dir (correct results, sharing silently lost, and `husk status` flags it as `not-a-link`). |
 | **Tooling assumptions** | `clone`, `hardlink`, and `copy` produce real directories, and no tool can tell the difference. `symlink` mode has the classic realpath caveats (Node's `__dirname` resolves into the store; Docker build contexts can't follow it), which is why it's opt-in rather than the default. Python venvs are path-bound by design: symlink mode works, clone mode is flagged by `doctor`. If you use `uv` or a global-cache package manager (pnpm, Go modules), you already have most of this; husk adds the most for npm-style per-project dirs. |
-| **When it breaks** | Every failure degrades toward `copy`, which is always correct. Dangling link: `husk doctor --fix` re-provisions. Lockfile drift: `status` and `doctor` flag it, `link` re-keys, `unlink` goes private. Store deleted: worktrees re-seed from any checkout with real dirs. husk can never make a worktree *less* correct than a plain worktree, only cheaper. |
+| **When it breaks** | Every failure degrades toward `copy`, which is always correct. Dangling link: `husk doctor --fix` re-provisions. Lockfile drift: `status` and `doctor` flag it, `link` re-keys, `unlink` goes private. Store deleted: worktrees re-seed from any checkout with real dirs. A store configured *inside* the repo is refused outright (deleting a worktree would destroy it). husk can never make a worktree *less* correct than a plain worktree, only cheaper. |
 
 ## Stale worktree reaping
 
@@ -212,7 +212,37 @@ filesystems in play, and anything that fails a probe falls off the ladder.
 
 ## Development
 
+Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
+`test/run.sh` (the whole test suite, plain assertions, no framework).
+
 ```sh
-./test/run.sh     # 46 tests, no framework, ~30s
-shellcheck bin/husk install.sh
+./test/run.sh                       # 62 tests, ~40s, runs in a throwaway tmpdir
+shellcheck bin/husk install.sh      # must stay clean (info-level notes are OK)
 ```
+
+Before claiming Linux works, run the suite as a **non-root** user on a real
+distro. Root bypasses permission checks and hides an entire class of bugs:
+
+```sh
+docker run --rm -v "$PWD":/husk ubuntu:24.04 bash -c '
+  apt-get update -qq && apt-get install -y -qq git perl openssl >/dev/null
+  useradd -m u && cp -r /husk /home/u/husk && chown -R u:u /home/u/husk
+  su - u -c "cd ~/husk && ./test/run.sh"'
+```
+
+Ground rules for changes:
+
+- **bash 3.2 compatible.** Stock macOS ships bash 3.2; no associative arrays,
+  no `mapfile`, no `${var,,}`.
+- **Zero dependencies** beyond git, perl, and openssl or sha256sum. Nothing
+  gets installed; every capability is probed at runtime and falls back.
+- **Never guess the platform.** Filesystem features (CoW clone, hardlinks,
+  real symlinks) are probed against the actual paths in play, not inferred
+  from `uname`.
+- **stdout is an API.** Machine-readable `key=value` lines only; prose and
+  warnings go to stderr. Agents parse stdout, so its format is stable.
+- **Every command is idempotent** and safe to interrupt. If you add a step
+  that holds a lock or builds a temp dir, register it for cleanup and give
+  `doctor --fix` a way to sweep the residue after a hard kill.
+- **A test per bug.** Anything that broke once gets a regression test in
+  `test/run.sh` so it can't break silently again.

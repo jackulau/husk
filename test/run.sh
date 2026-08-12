@@ -221,6 +221,58 @@ assert_not "fresh copy is a distinct inode" same_inode "$dd_store/$k1/blob.bin" 
 (cd "$TMP/dd" && "$HUSK" dedupe >/dev/null 2>&1)
 assert "husk dedupe re-links identical files" same_inode "$dd_store/$k1/blob.bin" "$dd_store/$k2/blob.bin"
 
+# ================= 14. hardening: stampede, residue sweep, store guard =================
+# installer stampede: 3 concurrent 'link --install' on the same store miss must run ONE installer
+mkdir -p "$TMP/shim"
+cat > "$TMP/shim/npm" <<'SHIM'
+#!/bin/sh
+# fake npm: log the invocation, produce a node_modules
+echo "ci" >> "$NPM_LOG"
+sleep 1
+mkdir -p node_modules/left-pad
+echo "module.exports=9 // stampede" > node_modules/left-pad/index.js
+SHIM
+chmod +x "$TMP/shim/npm"
+export NPM_LOG="$TMP/npm-calls.log"
+# one repo, three worktrees: same repo-id, same key, same store entry to race on
+mkdir -p "$TMP/st"; ( cd "$TMP/st" \
+  && git init -q -b main \
+  && echo '{"name":"st"}' > package.json \
+  && printf 'stampede-lock\n' > package-lock.json \
+  && git add -A && git commit -qm init \
+  && git worktree add -q ../st-w1 -b w1 \
+  && git worktree add -q ../st-w2 -b w2 \
+  && git worktree add -q ../st-w3 -b w3 )
+rc_st=0
+for i in 1 2 3; do
+  ( cd "$TMP/st-w$i" && PATH="$TMP/shim:$PATH" "$HUSK" link --install >/dev/null 2>&1 ) &
+done
+for j in $(jobs -p); do wait "$j" || rc_st=1; done
+assert "3 concurrent link --install all exited 0" test "$rc_st" -eq 0
+assert "stampede ran exactly one installer" test "$(wc -l < "$NPM_LOG" | tr -d ' ')" -eq 1
+assert "all 3 stampede worktrees got deps" bash -c "test -f '$TMP/st-w1/node_modules/left-pad/index.js' -a -f '$TMP/st-w2/node_modules/left-pad/index.js' -a -f '$TMP/st-w3/node_modules/left-pad/index.js'"
+st_base=$(cd "$TMP/st-w1" && "$HUSK" status 2>/dev/null | sed -n 's/^store=//p' | head -1)
+assert "stampede produced exactly one store entry" bash -c "[ \"\$(find '$st_base/node_modules' -mindepth 1 -maxdepth 1 -type d ! -name '*.lock' ! -name '*.tmp.*' | wc -l | tr -d ' ')\" -eq 1 ]"
+assert "no leftover locks/tmp after stampede" bash -c "! find '$st_base' \( -name '*.lock' -o -name '*.tmp.*' \) 2>/dev/null | grep -q ."
+
+# doctor sweeps orphaned tmp residue (dead pid) but spares a live one
+res_store=$(dirname "$(find "$HUSK_STORE" -type d -name "$key" -print -quit)")
+mkdir -p "$res_store/deadentry.tmp.99999999"
+mkdir -p "$TMP/repo/node_modules.husk-tmp.99999999"
+mkdir -p "$res_store/liveentry.tmp.$$"
+cd "$TMP/repo"
+assert "doctor flags store tmp residue" bash -c "'$HUSK' doctor | grep -q 'tmp-residue.*deadentry'"
+assert "doctor flags worktree tmp residue" bash -c "'$HUSK' doctor | grep -q 'tmp-residue.*node_modules.husk-tmp'"
+"$HUSK" doctor --fix >/dev/null 2>&1
+assert "doctor --fix removed store tmp residue" bash -c "[ ! -d '$res_store/deadentry.tmp.99999999' ]"
+assert "doctor --fix removed worktree tmp residue" bash -c "[ ! -d '$TMP/repo/node_modules.husk-tmp.99999999' ]"
+assert "doctor --fix spared live-pid tmp" test -d "$res_store/liveentry.tmp.$$"
+rm -rf "$res_store/liveentry.tmp.$$"
+
+# store-inside-repo guard: refuse before any damage can happen
+assert_not "store inside repo is refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link"
+assert "guard names the problem" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link 2>&1 | grep -q 'inside the repo'"
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

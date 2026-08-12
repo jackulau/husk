@@ -74,7 +74,23 @@ load_conf() { # .husk.conf at repo root may set HUSK_DIRS / HUSK_MODE / HUSK_STO
   local root="$1"
   # shellcheck disable=SC1091
   [ -f "$root/.husk.conf" ] && . "$root/.husk.conf"
-  true
+  store_guard "$root"
+}
+
+store_guard() { # root -> refuse a store inside the repo: 'git worktree remove',
+  # 'husk reap' or a plain rm -rf of the checkout would destroy every entry
+  local root="$1" sb d
+  sb="$HUSK_STORE"
+  case "$sb" in /*) ;; *) sb="$(pwd)/$sb" ;; esac
+  # resolve through the nearest existing ancestor: the store may not exist yet,
+  # and /var -> /private/var style symlinks would otherwise dodge the comparison
+  d="$sb"
+  while [ ! -d "$d" ] && [ "$d" != "/" ]; do d=$(dirname "$d"); done
+  sb="$(cd "$d" && pwd -P)${sb#"$d"}"
+  root=$(cd "$root" 2>/dev/null && pwd -P) || return 0
+  case "$sb" in
+    "$root"|"$root"/*) die "HUSK_STORE ($sb) is inside the repo ($root); deleting a worktree would destroy the store. Set HUSK_STORE to a path outside the repo." ;;
+  esac
 }
 
 # ---------- lockfile mapping ----------
@@ -148,8 +164,24 @@ acquire_lock() { # lockdir
     sleep 1; waited=$((waited + 1))
   done
   echo $$ > "$lock/pid"
+  HUSK_CLEAN_LOCK="$lock"
 }
-release_lock() { rm -rf "$1"; }
+release_lock() { rm -rf "$1"; HUSK_CLEAN_LOCK=""; }
+
+# interruption safety: Ctrl-C or kill mid-seed must not strand a held lock
+# (siblings would stall until timeout/steal) or a half-built tmp dir.
+# Tracked globals are set while owned, cleared on clean handoff; the EXIT
+# trap sweeps whatever is still marked. rm_rf_safe is defined just below.
+HUSK_CLEAN_LOCK=""
+HUSK_CLEAN_TMP=""
+husk_cleanup() {
+  [ -n "$HUSK_CLEAN_TMP" ] && rm_rf_safe "$HUSK_CLEAN_TMP" 2>/dev/null
+  [ -n "$HUSK_CLEAN_LOCK" ] && rm -rf "$HUSK_CLEAN_LOCK" 2>/dev/null
+  return 0
+}
+trap husk_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ---------- copy engines ----------
 rm_rf_safe() { # dir -> remove even when copies inherited a read-only root (mode 555):
@@ -375,14 +407,11 @@ strip_meta() { # dir -> remove husk store metadata (must never ride along into a
   rm -f "$1/.husk-manifest" "$1/.husk-seeded" 2>/dev/null || true
 }
 
-seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if exists)
-  local src="$1" entry="$2" parent lock tmp sib
+seed_entry_locked() { # source-real-dir entry -> seeds; caller MUST hold the entry lock
+  local src="$1" entry="$2" tmp sib
   [ -d "$entry" ] && return 0
-  parent=$(dirname "$entry"); mkdir -p "$parent"
-  lock="$entry.lock"
-  acquire_lock "$lock"
-  if [ -d "$entry" ]; then release_lock "$lock"; return 0; fi  # raced, winner seeded
   tmp="$entry.tmp.$$"
+  HUSK_CLEAN_TMP="$tmp"
   rm_rf_safe "$tmp"
   if cow_clone "$src" "$tmp"; then :; else plain_copy "$src" "$tmp"; fi
   strip_meta "$tmp"
@@ -393,6 +422,17 @@ seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if
   sig_file_for "$tmp" >/dev/null 2>&1 || true   # cache manifest for future siblings
   date +%s > "$tmp/.husk-seeded" 2>/dev/null || true
   mv "$tmp" "$entry"
+  HUSK_CLEAN_TMP=""
+}
+
+seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if exists)
+  local src="$1" entry="$2" parent lock
+  [ -d "$entry" ] && return 0
+  parent=$(dirname "$entry"); mkdir -p "$parent"
+  lock="$entry.lock"
+  acquire_lock "$lock"
+  if [ -d "$entry" ]; then release_lock "$lock"; return 0; fi  # raced, winner seeded
+  seed_entry_locked "$src" "$entry"
   release_lock "$lock"
 }
 
@@ -402,17 +442,21 @@ provision() { # entry target mode
   case "$mode" in
     clone)
       tmp="$target.husk-tmp.$$"
+      HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
-      cow_clone "$entry" "$tmp" || { rm_rf_safe "$tmp"; return 1; }
+      cow_clone "$entry" "$tmp" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       strip_meta "$tmp"
       rm_rf_safe "$target"; mv "$tmp" "$target"
+      HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;   # private copy: undo inherited write guard
     hardlink)
       tmp="$target.husk-tmp.$$"
+      HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
-      hardlink_farm "$entry" "$tmp" || { rm_rf_safe "$tmp"; return 1; }
+      hardlink_farm "$entry" "$tmp" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       strip_meta "$tmp"
       rm_rf_safe "$target"; mv "$tmp" "$target"
+      HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;
     symlink)
       chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
@@ -421,10 +465,12 @@ provision() { # entry target mode
       ln -s "$entry" "$tmp"; mv "$tmp" "$target" ;;
     copy)
       tmp="$target.husk-tmp.$$"
+      HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
-      plain_copy "$entry" "$tmp"
+      plain_copy "$entry" "$tmp" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       strip_meta "$tmp"
       rm_rf_safe "$target"; mv "$tmp" "$target"
+      HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;
     *) die "unknown mode: $mode" ;;
   esac
@@ -497,12 +543,19 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
       fi
     fi
   fi
-  # 3. run the installer (opt-in), then seed from the result
+  # 3. run the installer (opt-in), then seed from the result. Serialized under the
+  # entry lock so N agents hitting a fresh lockfile run ONE installer, not N:
+  # the winner installs + seeds, the rest wake to a ready entry and provision.
   if [ ! -d "$entry" ] && [ "$do_install" = "1" ]; then
-    note "$dir: store miss; running installer"
-    run_install "$root" "$dir" || die "$dir: installer failed"
-    [ -d "$target" ] || die "$dir: installer did not produce $target"
-    seed_entry "$target" "$entry"
+    mkdir -p "$(dirname "$entry")"
+    acquire_lock "$entry.lock"
+    if [ ! -d "$entry" ]; then
+      note "$dir: store miss; running installer"
+      run_install "$root" "$dir" || die "$dir: installer failed"
+      [ -d "$target" ] || die "$dir: installer did not produce $target"
+      seed_entry_locked "$target" "$entry"
+    fi
+    release_lock "$entry.lock"
   fi
 
   if [ ! -d "$entry" ]; then
@@ -519,7 +572,7 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
     provision "$entry" "$target" "$mode" || {
       note "$dir: $mode provisioning failed; falling back to copy"
       mode=copy
-      provision "$entry" "$target" "$mode"
+      provision "$entry" "$target" "$mode" || die "$dir: provisioning failed (disk full?); worktree left without $dir"
     }
   fi
 
@@ -710,6 +763,20 @@ cmd_doctor() {
       if [ $fix -eq 1 ]; then note "removing stale lock: $lock"; rm -rf "$lock"
       else out "issue kind=stale-lock path=$lock fix='husk doctor --fix'"; fi
     fi
+  done
+  # orphaned tmp residue from an interrupted seed (store) or provision (worktree).
+  # The pid is baked into the name; skip tmps whose owner is still running.
+  local tmpd
+  for tmpd in "$(store_base)"/*/*.tmp.* "$root"/*.husk-tmp.*; do
+    [ -e "$tmpd" ] || [ -L "$tmpd" ] || continue
+    pid=${tmpd##*.}
+    case "$pid" in *[!0-9]*|'') pid="" ;; esac
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
+    issues=$((issues+1))
+    if [ $fix -eq 1 ]; then
+      note "removing orphaned tmp: $tmpd"
+      if [ -L "$tmpd" ]; then rm -f "$tmpd"; else rm_rf_safe "$tmpd"; fi
+    else out "issue kind=tmp-residue path=$tmpd fix='husk doctor --fix'"; fi
   done
   [ $issues -eq 0 ] && out "doctor ok=1" || out "doctor issues=$issues fixed=$fix"
 }
