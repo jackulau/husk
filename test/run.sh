@@ -108,6 +108,13 @@ cd "$TMP/repo2"
 assert "unlink: no longer a symlink" bash -c "[ ! -L '$TMP/repo2/node_modules' ]"
 assert "unlink: files present and private" test -f "$TMP/repo2/node_modules/left-pad/index.js"
 assert "unlink: writable again" bash -c "touch '$TMP/repo2/node_modules/probe' && rm '$TMP/repo2/node_modules/probe'"
+assert "unlink: store metadata not leaked into worktree" bash -c "[ ! -e '$TMP/repo2/node_modules/.husk-manifest' ] && [ ! -e '$TMP/repo2/node_modules/.husk-seeded' ]"
+# poison regression: edit a file post-unlink, bump lockfile, adopt; the new entry
+# must carry the NEW content (a stale inherited manifest once fooled dedupe here)
+echo "poisoned? no // edited-after-unlink" > "$TMP/repo2/node_modules/left-pad/index.js"
+printf '%s\n' "lock-v3-postunlink" > "$TMP/repo2/package-lock.json"
+k3=$(cd "$TMP/repo2" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+assert "reseed after unlink+edit stores the edited content" bash -c "grep -q 'edited-after-unlink' \"\$(find '$HUSK_STORE' -type d -name '$k3')/left-pad/index.js\""
 
 # ================= 8. concurrent link race (one seeds, all succeed) =================
 make_repo "$TMP/repo3" "rlock-v1"
@@ -162,10 +169,18 @@ repo_store=$(dirname "$(find "$HUSK_STORE" -type d -name "$live_key" -print -qui
 mkdir -p "$repo_store/deadbeefdeadbeef"
 echo orphan > "$repo_store/deadbeefdeadbeef/file"
 printf '%s\n' "$TMP/gone-worktree" > "$repo_store/deadbeefdeadbeef.refs"
+# make the live entry's ref-check load-bearing: age it past the seed grace period
+echo 0 > "$repo_store/$live_key/.husk-seeded" 2>/dev/null
+# freshly seeded orphan must survive gc (ref may not be written yet)
+mkdir -p "$repo_store/feedfacefeedface"
+date +%s > "$repo_store/feedfacefeedface/.husk-seeded"
 assert "gc --dry-run lists the orphan entry" bash -c "'$HUSK' gc --dry-run | grep -q deadbeefdeadbeef"
+assert_not "gc --dry-run spares the freshly seeded entry" bash -c "'$HUSK' gc --dry-run | grep -q feedfacefeedface"
 "$HUSK" gc >/dev/null 2>&1
 assert "gc removed the orphan entry" bash -c "[ ! -d '$repo_store/deadbeefdeadbeef' ]"
 assert "gc kept the entry a live worktree references" test -d "$repo_store/$live_key"
+assert "gc kept the freshly seeded entry (grace period)" test -d "$repo_store/feedfacefeedface"
+rm -rf "$repo_store/feedfacefeedface"
 
 # ================= 11. install.sh =================
 BIN_DIR="$TMP/bindir"
@@ -192,7 +207,9 @@ echo "module.exports=2 // dd-lock-v2" > node_modules/left-pad/index.js
 k2=$("$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
 dd_store=$(dirname "$(find "$HUSK_STORE" -type d -name "$k1" -print -quit)")
 assert "second lockfile made a second entry" test -d "$dd_store/$k2"
-same_inode() { [ "$(stat -f %i "$1" 2>/dev/null || stat -c %i "$1")" = "$(stat -f %i "$2" 2>/dev/null || stat -c %i "$2")" ]; }
+# -c first: BSD stat fails it cleanly, while GNU 'stat -f %i' pollutes stdout before failing
+inode_of() { stat -c %i "$1" 2>/dev/null || stat -f %i "$1" 2>/dev/null; }
+same_inode() { i1=$(inode_of "$1"); i2=$(inode_of "$2"); [ -n "$i1" ] && [ "$i1" = "$i2" ]; }
 assert "identical file hardlinked across entries" same_inode "$dd_store/$k1/blob.bin" "$dd_store/$k2/blob.bin"
 assert_not "differing file NOT hardlinked" same_inode "$dd_store/$k1/left-pad/index.js" "$dd_store/$k2/left-pad/index.js"
 assert "new entry content is the new version" grep -q "dd-lock-v2" "$dd_store/$k2/left-pad/index.js"

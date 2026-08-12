@@ -152,22 +152,74 @@ acquire_lock() { # lockdir
 release_lock() { rm -rf "$1"; }
 
 # ---------- copy engines ----------
-cow_clone() { # src dst -> 0 if CoW clone succeeded
-  if cp -c -R "$1" "$2" 2>/dev/null; then return 0; fi          # macOS APFS clonefile
-  if cp -R --reflink=always "$1" "$2" 2>/dev/null; then return 0; fi  # btrfs/xfs
-  return 1
+rm_rf_safe() { # dir -> remove even when copies inherited a read-only root (mode 555):
+  # a non-root rm -rf cannot unlink children of an unwritable dir, so unguard first
+  [ -e "$1" ] || return 0
+  chmod -R u+w "$1" 2>/dev/null || true
+  rm -rf "$1"
 }
 
-hardlink_farm() { # src dst
+par_fanout() { # src dst clone|copy -> parallel per-top-level-entry copy across cores
+  local src="$1" dst="$2" op="$3" j
+  j=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+  [ "$j" -gt 8 ] && j=8
+  case "$dst" in /*) ;; *) dst="$(pwd)/$dst" ;; esac
+  mkdir "$dst" 2>/dev/null || return 1
+  if [ "$op" = clone ]; then
+    ( cd "$src" && find . -mindepth 1 -maxdepth 1 -print0 \
+      | xargs -0 -P "$j" -n 20 sh -c 'exec cp -c -R "$@" "$0/"' "$dst" ) 2>/dev/null && return 0
+  else
+    ( cd "$src" && find . -mindepth 1 -maxdepth 1 -print0 \
+      | xargs -0 -P "$j" -n 20 sh -c 'exec cp -Rp "$@" "$0/"' "$dst" ) 2>/dev/null && return 0
+  fi
+  rm_rf_safe "$dst"; return 1
+}
+
+cow_clone() { # src dst -> 0 if CoW clone succeeded; never leaves a partial dst
+  if [ -d "$1" ] && par_fanout "$1" "$2" clone; then return 0; fi     # macOS APFS, fanned out
+  if cp -c -R "$1" "$2" 2>/dev/null; then return 0; fi                # macOS serial (files, edge cases)
+  rm_rf_safe "$2"
+  if cp -R --reflink=always "$1" "$2" 2>/dev/null; then return 0; fi  # btrfs/xfs
+  rm_rf_safe "$2"           # GNU cp fails per-file AFTER creating dirs (with source
+  return 1                  # modes, possibly read-only); residue would jam every fallback
+}
+
+hardlink_farm() { # src dst -> 0 on success; never leaves a partial dst
   if cp -al "$1" "$2" 2>/dev/null; then return 0; fi            # GNU cp
+  rm_rf_safe "$2"
+  if command -v perl >/dev/null 2>&1; then
+    # one process, one link(2) per file (BSD pax forks its way to ~10x slower)
+    if perl -MFile::Find -e '
+      my ($src, $dst) = @ARGV;
+      my $err = 0;
+      mkdir $dst or exit 1;
+      find({ no_chdir => 1, wanted => sub {
+        my $n = $File::Find::name;
+        my $rel = substr($n, length($src));
+        return unless length $rel;
+        my $t = "$dst$rel";
+        lstat $n;
+        if    (-l _) { symlink(readlink($n), $t) or $err++ }
+        elsif (-d _) { mkdir($t) or $err++; chmod((stat($n))[2] & 07777, $t) }
+        else         { link($n, $t) or $err++ }
+      }}, $src);
+      exit($err ? 1 : 0);
+    ' "$1" "$2" 2>/dev/null; then return 0; fi
+    rm_rf_safe "$2"
+  fi
   if command -v pax >/dev/null 2>&1; then
     mkdir -p "$2" && (cd "$1" && pax -rwl . "$(cd "$2" && pwd)") 2>/dev/null && return 0
-    rm -rf "$2"
+    rm_rf_safe "$2"
   fi
   return 1
 }
 
-plain_copy() { cp -Rp "$1" "$2"; }
+plain_copy() { # src dst -> dst must not pre-exist (partial dst is removed, see cow_clone)
+  if [ -d "$1" ] && par_fanout "$1" "$2" copy; then return 0; fi
+  rm_rf_safe "$2"
+  cp -Rp "$1" "$2" || { rm_rf_safe "$2"; return 1; }
+  chmod u+w "$2" 2>/dev/null || true   # source root may be write-guarded; a copy is private
+}
 
 probe_mode() { # decide best mode: store entry -> worktree target fs
   local storefs="$1" wtfs="$2"
@@ -177,8 +229,13 @@ probe_mode() { # decide best mode: store entry -> worktree target fs
   echo probe > "$probe"
   if cow_clone "$probe" "$t"; then rm -f "$t" "$probe"; printf 'clone'; return 0; fi
   if ln "$probe" "$t" 2>/dev/null; then rm -f "$t" "$probe"; printf 'hardlink'; return 0; fi
-  rm -f "$probe"
-  printf 'symlink'
+  # verify symlinks are REAL here: MSYS/Git Bash "ln -s" silently copies unless
+  # symlink privilege is enabled, which would fake sharing while eating full disk
+  if ln -s "$probe" "$t" 2>/dev/null && [ -L "$t" ]; then
+    rm -f "$t" "$probe"; printf 'symlink'; return 0
+  fi
+  rm -f "$t" "$probe"
+  printf 'copy'
 }
 
 # ---------- worktree state (.husk/state: dir<TAB>key<TAB>mode) ----------
@@ -313,6 +370,11 @@ dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+pe
 }
 
 # ---------- seeding ----------
+strip_meta() { # dir -> remove husk store metadata (must never ride along into a reseed
+  # or a worktree: a stale inherited .husk-manifest would poison dedupe with old hashes)
+  rm -f "$1/.husk-manifest" "$1/.husk-seeded" 2>/dev/null || true
+}
+
 seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if exists)
   local src="$1" entry="$2" parent lock tmp sib
   [ -d "$entry" ] && return 0
@@ -321,8 +383,9 @@ seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if
   acquire_lock "$lock"
   if [ -d "$entry" ]; then release_lock "$lock"; return 0; fi  # raced, winner seeded
   tmp="$entry.tmp.$$"
-  rm -rf "$tmp"
+  rm_rf_safe "$tmp"
   if cow_clone "$src" "$tmp"; then :; else plain_copy "$src" "$tmp"; fi
+  strip_meta "$tmp"
   if [ "${HUSK_DEDUPE:-1}" = "1" ]; then
     sib=$(nearest_sibling "$entry")
     [ -n "$sib" ] && dedupe_entry "$tmp" "$sib"
@@ -339,26 +402,29 @@ provision() { # entry target mode
   case "$mode" in
     clone)
       tmp="$target.husk-tmp.$$"
-      rm -rf "$tmp"
-      cow_clone "$entry" "$tmp" || { rm -rf "$tmp"; return 1; }
-      rm -rf "$target"; mv "$tmp" "$target"
+      rm_rf_safe "$tmp"
+      cow_clone "$entry" "$tmp" || { rm_rf_safe "$tmp"; return 1; }
+      strip_meta "$tmp"
+      rm_rf_safe "$target"; mv "$tmp" "$target"
       chmod u+w "$target" 2>/dev/null || true ;;   # private copy: undo inherited write guard
     hardlink)
       tmp="$target.husk-tmp.$$"
-      rm -rf "$tmp"
-      hardlink_farm "$entry" "$tmp" || { rm -rf "$tmp"; return 1; }
-      rm -rf "$target"; mv "$tmp" "$target"
+      rm_rf_safe "$tmp"
+      hardlink_farm "$entry" "$tmp" || { rm_rf_safe "$tmp"; return 1; }
+      strip_meta "$tmp"
+      rm_rf_safe "$target"; mv "$tmp" "$target"
       chmod u+w "$target" 2>/dev/null || true ;;
     symlink)
       chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
       tmp="$target.husk-tmp.$$"
-      rm -rf "$target" "$tmp"
+      rm_rf_safe "$target"; rm -f "$tmp"
       ln -s "$entry" "$tmp"; mv "$tmp" "$target" ;;
     copy)
       tmp="$target.husk-tmp.$$"
-      rm -rf "$tmp"
+      rm_rf_safe "$tmp"
       plain_copy "$entry" "$tmp"
-      rm -rf "$target"; mv "$tmp" "$target"
+      strip_meta "$tmp"
+      rm_rf_safe "$target"; mv "$tmp" "$target"
       chmod u+w "$target" 2>/dev/null || true ;;
     *) die "unknown mode: $mode" ;;
   esac
@@ -514,10 +580,18 @@ cmd_add() {
   ( cd "$path" && cmd_link $install_flag ) || true
   out "worktree path=$(abspath "$path")"
 
-  # opportunistic reap nudge (no daemon; fleet stays bounded)
-  local stale
-  stale=$(cmd_reap --dry-run --quiet | grep -c '^reap ' || true)
-  [ "$stale" -gt 0 ] && note "$stale stale worktree(s) detected; run 'husk reap' to clean up"
+  # opportunistic reap nudge (no daemon; fleet stays bounded). The probe walks
+  # every worktree, so throttle it to hourly: at 100 worktrees an unthrottled
+  # probe makes every 'husk add' pay ~100 'git status' calls
+  local stale stamp nowts last
+  stamp="$(repo_common_dir)/husk-reap-probe"
+  nowts=$(date +%s); last=$(cat "$stamp" 2>/dev/null || echo 0)
+  case "$last" in *[!0-9]*|"") last=0 ;; esac
+  if [ $((nowts - last)) -ge "${HUSK_NUDGE_SECS:-3600}" ]; then
+    printf '%s' "$nowts" > "$stamp" 2>/dev/null || true
+    stale=$(cmd_reap --dry-run --quiet | grep -c '^reap ' || true)
+    [ "$stale" -gt 0 ] && note "$stale stale worktree(s) detected; run 'husk reap' to clean up"
+  fi
   return 0
 }
 
@@ -534,7 +608,7 @@ cmd_unlink() {
     target="$root/$d"
     if [ -L "$target" ]; then
       tmp="$target.husk-tmp.$$"
-      rm -rf "$tmp"
+      rm_rf_safe "$tmp"
       if [ -d "$entry" ]; then
         cow_clone "$entry" "$tmp" || plain_copy "$entry" "$tmp"
       else
@@ -543,6 +617,7 @@ cmd_unlink() {
         out "unlinked dir=$d materialized=0"
         continue
       fi
+      strip_meta "$tmp"
       rm -f "$target"; mv "$tmp" "$target"
     fi
     [ -d "$target" ] && chmod u+w "$target" 2>/dev/null || true
@@ -711,11 +786,18 @@ cmd_reap() {
 
 # ---------- gc (drop unreferenced store entries) ----------
 cmd_gc() {
-  local dry=0 base entry refs live wt freed key
+  local dry=0 base entry refs live wt freed key now seeded
   [ "${1:-}" = "--dry-run" ] && dry=1
   base=$(store_base)
   [ -d "$base" ] || { out "gc entries=0"; return 0; }
+  now=$(date +%s)
   find "$base" -mindepth 2 -maxdepth 2 -type d ! -name '*.lock' ! -name '*.tmp.*' | while read -r entry; do
+    # never touch an entry mid-seed (lock held) or younger than 10 minutes:
+    # a sibling 'husk link' may have seeded it but not yet written its ref
+    [ -d "$entry.lock" ] && continue
+    seeded=$(cat "$entry/.husk-seeded" 2>/dev/null || echo 0)
+    case "$seeded" in *[!0-9]*|"") seeded=0 ;; esac
+    [ $((now - seeded)) -lt 600 ] && continue
     refs="$entry.refs"
     live=0
     if [ -f "$refs" ]; then

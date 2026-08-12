@@ -8,7 +8,8 @@ for a full copy in each one, without giving up correctness.
 bytes. With husk it's a few GB. Built for agent-native workflows where 20-100
 concurrent worktrees is normal.
 
-One script, no dependencies. bash 3.2+ (stock macOS works), Linux, git.
+One script, no dependencies. bash 3.2+ (stock macOS works), Linux (suite green on
+Ubuntu 24.04), Windows via WSL.
 
 ## Install
 
@@ -86,19 +87,22 @@ apparent size:
 | approach | wall time | disk consumed |
 |---|---|---|
 | `git worktree add` + `npm ci` per worktree | 27.1s | 4,013 MB |
-| `husk add` (clone mode, default) | 30.5s | **61 MB** |
-| `husk add` (hardlink mode) | 56.6s | 34 MB |
+| `husk add` (clone mode, default) | **20.1s** | **61 MB** |
+| `husk add` (hardlink mode) | 51.6s | 39 MB |
 | `husk add` (symlink mode) | 4.3s | 2.5 MB |
-| `husk add` (copy mode) | 70.0s | 4,038 MB |
+| `husk add` (copy mode) | 45.7s | 3,954 MB |
 | 10 **concurrent** `husk add` (agent-thread race) | 26.3s | 63 MB |
 
-Notes worth being honest about: `npm ci` at 2.7s per worktree is a best case
-(warm cache, fast SSD); cold caches or private registries make the baseline
-minutes, while husk's numbers don't change. The concurrent run produced 10/10
-working worktrees with one store entry and no partial trees; wall time is bounded
-by git's own worktree lock, not by husk. Store dedupe across two lockfile
-versions: the second entry cost 21 MB instead of 395 MB and took about 11s to
-seed. Reproduce with `test/run.sh` plus the commands above.
+Provisioning fans out per-package across cores (capped at 8 jobs), so the default
+path is faster than a warm-cache `npm ci` while consuming 66x less disk. Notes
+worth being honest about: `npm ci` at 2.7s per worktree is a best case (warm
+cache, fast SSD); cold caches or private registries make the baseline minutes,
+while husk's numbers don't change. Hardlink mode is bounded by `link(2)` speed on
+APFS; on ext4, where it's the default, links are much cheaper. The concurrent run
+produced 10/10 working worktrees with one store entry and no partial trees; wall
+time is bounded by git's own worktree lock, not by husk. Store dedupe across two
+lockfile versions: the second entry cost 21 MB instead of 395 MB. Reproduce with
+`test/run.sh` plus the commands above.
 
 ## Commands
 
@@ -176,7 +180,22 @@ HUSK_MODE=auto                # auto | clone | hardlink | symlink | copy
 HUSK_DIRS="node_modules"      # override auto-detection
 HUSK_REAP_DAYS=7              # reap idle threshold
 HUSK_DEDUPE=1                 # hardlink identical files across store entries at seed time
+HUSK_NUDGE_SECS=3600          # how often 'husk add' probes for stale worktrees
 ```
+
+## Platforms
+
+- **macOS**: primary target. APFS clonefile gives the default `clone` mode.
+- **Linux**: fully supported, test suite runs green on Ubuntu 24.04. btrfs and XFS
+  get `clone` (reflink), ext4 and overlayfs get `hardlink`. Needs git, perl, and
+  openssl or sha256sum (all present on any dev box).
+- **Windows**: use WSL (that is the Linux path above). Native Git Bash is
+  best-effort: NTFS hardlinks work, so the probe lands on `hardlink` mode; the
+  probe also verifies symlinks are real before ever choosing them, because MSYS
+  fakes `ln -s` with a copy unless Developer Mode is on. Not CI-tested yet.
+
+husk never guesses the platform. Every mode is probed against the actual
+filesystems in play, and anything that fails a probe falls off the ladder.
 
 ## What husk is not
 
@@ -186,8 +205,6 @@ HUSK_DEDUPE=1                 # hardlink identical files across store entries at
   filesystem operations.
 - **Not a git proxy.** Considered and rejected: PATH shims over `git` are fragile
   and surprising. One extra verb (`husk add`) buys the same ergonomics safely.
-- **Not Windows-ready** (v1). Symlink privileges and no clonefile; NTFS hardlinks
-  could work as future work.
 
 ## License
 
