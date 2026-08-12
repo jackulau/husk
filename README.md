@@ -153,7 +153,7 @@ changes behavior.
 | axis | how husk handles it |
 |---|---|
 | **Correctness / isolation** | Store entries are keyed by lockfile hash, so a branch with a different lockfile can never silently get the wrong deps. Default `clone` mode gives fully private writes. A worktree whose lockfile changed is *refused* sharing until deps are reinstalled (`--install`) or explicitly trusted (`adopt`). |
-| **Concurrency / write contention** | Store seeding is serialized by a portable lock with atomic rename: 100 parallel `husk link` calls produce exactly one entry, and no partial tree is ever visible. The same lock serializes `--install`, so 100 agents hitting a fresh lockfile run **one** installer while 99 wait and reuse the result. Interrupted commands clean up after themselves (held locks and half-built temp dirs are released on exit), a killed process's lock is stolen once its pid is gone, and `husk doctor --fix` sweeps any residue that survives a hard kill. Provisioning from an existing entry is lock-free. In `symlink` mode the entry root is made read-only, so direct writes fail loudly (EACCES). An accidental `npm install` can't poison siblings either: npm replaces the symlink with a fresh private dir (correct results, sharing silently lost, and `husk status` flags it as `not-a-link`). |
+| **Concurrency / write contention** | Store seeding is serialized by a portable lock with atomic rename: 100 parallel `husk link` calls produce exactly one entry, and no partial tree is ever visible. The same lock serializes `--install`, so 100 agents hitting a fresh lockfile run **one** installer while 99 wait and reuse the result. Interrupted commands clean up after themselves (held locks and half-built temp dirs are released on exit), a killed process's lock is stolen once its pid is gone (steal is rename-then-verify, so two stealers can never wipe a lock a third process just took), and `husk doctor --fix` sweeps any residue that survives a hard kill. `gc` re-verifies under the entry lock before deleting, treats the repo's actual worktrees (not just ref files) as the source of truth for liveness, and never touches an entry that was seeded or provisioned from in the last 10 minutes. Provisioning from an existing entry is lock-free. In `symlink` mode the entry root is made read-only, so direct writes fail loudly (EACCES). An accidental `npm install` can't poison siblings either: npm replaces the symlink with a fresh private dir (correct results, sharing silently lost, and `husk status` flags it as `not-a-link`). |
 | **Tooling assumptions** | `clone`, `hardlink`, and `copy` produce real directories, and no tool can tell the difference. `symlink` mode has the classic realpath caveats (Node's `__dirname` resolves into the store; Docker build contexts can't follow it), which is why it's opt-in rather than the default. Python venvs are path-bound by design: symlink mode works, clone mode is flagged by `doctor`. If you use `uv` or a global-cache package manager (pnpm, Go modules), you already have most of this; husk adds the most for npm-style per-project dirs. |
 | **When it breaks** | Every failure degrades toward `copy`, which is always correct. Dangling link: `husk doctor --fix` re-provisions. Lockfile drift: `status` and `doctor` flag it, `link` re-keys, `unlink` goes private. Store deleted: worktrees re-seed from any checkout with real dirs. A store configured *inside* the repo is refused outright (deleting a worktree would destroy it). husk can never make a worktree *less* correct than a plain worktree, only cheaper. |
 
@@ -172,7 +172,7 @@ any resident process.
 
 ## Configuration
 
-Environment (or `.husk.conf` at repo root, shell syntax):
+Environment variables, or `.husk.conf` at the repo root:
 
 ```sh
 HUSK_STORE=~/.husk/store      # store location
@@ -181,7 +181,16 @@ HUSK_DIRS="node_modules"      # override auto-detection
 HUSK_REAP_DAYS=7              # reap idle threshold
 HUSK_DEDUPE=1                 # hardlink identical files across store entries at seed time
 HUSK_NUDGE_SECS=3600          # how often 'husk add' probes for stale worktrees
+HUSK_LOCK_TIMEOUT=120         # seconds to wait for an orphaned lock
+HUSK_LOCK_TIMEOUT_BUSY=3600   # seconds to wait for a lock whose holder is alive (e.g. an installer)
 ```
+
+`.husk.conf` is plain `KEY=VALUE` lines and is **parsed, never sourced**: agents
+run husk inside freshly cloned repositories, so a config file that executed
+shell would hand any repo arbitrary code execution. Unknown keys are ignored
+with a warning, `HUSK_MODE` is validated against the mode list, and numeric
+fields must be numeric. A leading `~/` or `$HOME/` in a value is expanded;
+nothing else is.
 
 ## Platforms
 
@@ -216,7 +225,8 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 62 tests, ~40s, runs in a throwaway tmpdir
+./test/run.sh                       # 81 tests, ~60s, runs in a throwaway tmpdir
+HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck bin/husk install.sh      # must stay clean (info-level notes are OK)
 ```
 

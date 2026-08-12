@@ -273,6 +273,128 @@ rm -rf "$res_store/liveentry.tmp.$$"
 assert_not "store inside repo is refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link"
 assert "guard names the problem" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link 2>&1 | grep -q 'inside the repo'"
 
+# ================= 15. lock + gc race hardening =================
+# a LIVE lock holder slower than HUSK_LOCK_TIMEOUT must not kill waiters
+# (the winner of an install stampede legitimately runs a multi-minute npm ci)
+cat > "$TMP/shim/npm" <<'SHIM'
+#!/bin/sh
+echo "ci" >> "$NPM_LOG"
+sleep 4
+mkdir -p node_modules/left-pad
+echo "module.exports=10 // slow" > node_modules/left-pad/index.js
+SHIM
+( cd "$TMP/st" && printf 'slow-lock\n' > package-lock.json && git add -A && git commit -qm bump \
+  && git -C "$TMP/st-w1" checkout -q w1 && git -C "$TMP/st-w1" merge -q main \
+  && git -C "$TMP/st-w2" checkout -q w2 && git -C "$TMP/st-w2" merge -q main )
+: > "$NPM_LOG"
+rc_slow=0
+for i in 1 2; do
+  ( cd "$TMP/st-w$i" && PATH="$TMP/shim:$PATH" HUSK_LOCK_TIMEOUT=2 "$HUSK" link --install >/dev/null 2>&1 ) &
+done
+for j in $(jobs -p); do wait "$j" || rc_slow=1; done
+assert "waiter survives live holder slower than HUSK_LOCK_TIMEOUT" test "$rc_slow" -eq 0
+assert "slow stampede still ran exactly one installer" test "$(wc -l < "$NPM_LOG" | tr -d ' ')" -eq 1
+
+# pid-less stale lock (holder died between mkdir and pid write) gets stolen once old
+make_repo "$TMP/pl" "pl-lock-v1"
+cd "$TMP/pl"
+pl_out=$("$HUSK" link 2>/dev/null)
+pl_key=$(printf '%s' "$pl_out" | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+pl_entry=$(find "$HUSK_STORE" -type d -name "$pl_key" -print -quit)
+chmod -R u+w "$pl_entry" && rm -rf "$pl_entry"     # force a reseed
+mkdir "$pl_entry.lock"                              # pid-less: no pid file inside
+touch -t 202601010101 "$pl_entry.lock"              # far in the past
+assert "pid-less stale lock is stolen, link reseeds" bash -c "cd '$TMP/pl' && HUSK_LOCK_TIMEOUT=90 '$HUSK' link | grep -q linked"
+assert "stolen lock is gone" bash -c "[ ! -d '$pl_entry.lock' ]"
+
+# gc honors the in-use stamp: old unreferenced entry mid-provision must survive
+pl_store=$(dirname "$pl_entry")
+mkdir -p "$pl_store/cafebabecafebabe"; echo x > "$pl_store/cafebabecafebabe/f"
+echo 0 > "$pl_store/cafebabecafebabe/.husk-seeded"   # long past seed grace
+date +%s > "$pl_store/cafebabecafebabe.used"          # but provisioning right now
+assert_not "gc spares entry with fresh in-use stamp" bash -c "cd '$TMP/pl' && '$HUSK' gc --dry-run | grep -q cafebabecafebabe"
+echo 0 > "$pl_store/cafebabecafebabe.used"            # stamp aged out
+assert "gc collects entry once in-use stamp ages" bash -c "cd '$TMP/pl' && '$HUSK' gc --dry-run | grep -q cafebabecafebabe"
+(cd "$TMP/pl" && "$HUSK" gc >/dev/null 2>&1)
+assert "gc removed the aged entry and its stamp" bash -c "[ ! -d '$pl_store/cafebabecafebabe' ] && [ ! -f '$pl_store/cafebabecafebabe.used' ]"
+
+# ================= 16. conf safety, gc authority, exit codes, edge paths =================
+# .husk.conf is parsed, never sourced: injection attempts must not execute
+make_repo "$TMP/cf" "cf-lock-v1"
+cd "$TMP/cf"
+cat > .husk.conf <<CONF
+# comment line
+HUSK_MODE=copy
+HUSK_REAP_DAYS=\$(touch $TMP/pwned1)
+PWN=\`touch $TMP/pwned2\`
+CONF
+assert "conf HUSK_MODE honored by parser" bash -c "cd '$TMP/cf' && '$HUSK' link | grep -q 'mode=copy'"
+assert "conf injection: command substitution not executed" bash -c "[ ! -e '$TMP/pwned1' ] && [ ! -e '$TMP/pwned2' ]"
+rm -f .husk.conf
+
+# gc liveness comes from worktree state, not .refs alone: a process killed
+# between state_set and add_ref must not cost the worktree its entry
+cf_key=$(cd "$TMP/cf" && "$HUSK" status | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+cf_entry=$(find "$HUSK_STORE" -type d -name "$cf_key" -print -quit)
+echo 0 > "$cf_entry/.husk-seeded"
+echo 0 > "$cf_entry.used"
+rm -f "$cf_entry.refs"                      # simulate the lost ref
+(cd "$TMP/cf" && "$HUSK" gc >/dev/null 2>&1)
+assert "gc keeps entry referenced only by worktree state" test -d "$cf_entry"
+assert "gc healed the missing ref" bash -c "grep -q 'cf' '$cf_entry.refs'"
+
+# husk add propagates needs-install (exit 2) instead of swallowing it
+mkdir -p "$TMP/x2"; ( cd "$TMP/x2" && git init -q -b main \
+  && echo '{"name":"x2"}' > package.json && printf 'x2-lock-nowhere\n' > package-lock.json \
+  && git add -A && git commit -qm i )
+rc_x2=0
+( cd "$TMP/x2" && "$HUSK" add ../x2-wt b-x2 >/dev/null 2>&1 ) || rc_x2=$?
+assert "husk add propagates needs-install exit 2" test "$rc_x2" -eq 2
+assert "worktree still created on store miss" test -d "$TMP/x2-wt"
+
+# doctor sweeps .husk-old replace residue
+mkdir -p "$TMP/repo/node_modules.husk-old.99999999"
+cd "$TMP/repo"
+assert "doctor flags .husk-old residue" bash -c "'$HUSK' doctor | grep -q 'node_modules.husk-old'"
+"$HUSK" doctor --fix >/dev/null 2>&1
+assert "doctor --fix removed .husk-old residue" bash -c "[ ! -d '$TMP/repo/node_modules.husk-old.99999999' ]"
+
+# spaces in repo, store, and worktree paths work end to end
+mkdir -p "$TMP/sp repo"; ( cd "$TMP/sp repo" && git init -q -b main \
+  && echo '{"name":"sp"}' > package.json && printf 'sp-lock\n' > package-lock.json \
+  && mkdir -p node_modules/left-pad && echo m > node_modules/left-pad/index.js \
+  && git add -A && git commit -qm i )
+assert "link works with spaces in repo+store paths" bash -c "cd '$TMP/sp repo' && HUSK_STORE='$TMP/sp store' '$HUSK' link | grep -q linked"
+assert "add works with spaces everywhere" bash -c "cd '$TMP/sp repo' && HUSK_STORE='$TMP/sp store' '$HUSK' add '../sp wt' spb >/dev/null 2>&1 && test -e '$TMP/sp wt/node_modules/left-pad/index.js'"
+
+# store_guard resolves symlink aliases: alias pointing into the repo is refused
+mkdir -p "$TMP/repo/.mystore2"; ln -s "$TMP/repo/.mystore2" "$TMP/alias-store"
+assert_not "store via symlink alias into repo refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/alias-store' '$HUSK' link"
+
+# ...while a legitimately external symlinked store still works
+mkdir -p "$TMP/real-store"; ln -s "$TMP/real-store" "$TMP/store-link"
+assert "external symlinked store works" bash -c "cd '$TMP/cf' && HUSK_STORE='$TMP/store-link' '$HUSK' link | grep -q linked"
+
+# ================= 17. stress: hostile names + big tree (opt-in: HUSK_STRESS=1) =================
+if [ "${HUSK_STRESS:-0}" = "1" ]; then
+  mkdir -p "$TMP/stress"; ( cd "$TMP/stress" && git init -q -b main \
+    && echo '{"name":"stress"}' > package.json && printf 'stress-lock\n' > package-lock.json \
+    && git add -A && git commit -qm i )
+  cd "$TMP/stress"
+  mkdir -p node_modules
+  ( cd node_modules
+    d=deep; for i in $(seq 1 45); do d="$d/n$i"; done; mkdir -p "$d"; echo x > "$d/leaf.js"
+    mkdir -p "-dashdir" "empty-dir" "uni-\xc3\xa9\xc3\xb6" 2>/dev/null || mkdir -p "unidir"
+    echo x > "./-dashfile"; : > zero-byte; dd if=/dev/zero of=big.bin bs=1048576 count=8 2>/dev/null
+    i=0; while [ $i -lt "${HUSK_STRESS_FILES:-2000}" ]; do
+      mkdir -p "pkg$((i % 50))"; echo "m$i" > "pkg$((i % 50))/f$i.js"; i=$((i+1))
+    done )
+  assert "stress: link succeeds on hostile tree" bash -c "cd '$TMP/stress' && '$HUSK' link | grep -q linked"
+  printf 'stress-lock-2\n' > package-lock.json
+  assert "stress: adopt+dedupe succeed on hostile tree" bash -c "cd '$TMP/stress' && '$HUSK' adopt | grep -q adopted"
+  assert "stress: deep leaf survived" bash -c "find \"\$(find '$HUSK_STORE' -type d -name 'n45' | head -1)\" -name leaf.js | grep -q leaf"
+fi
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

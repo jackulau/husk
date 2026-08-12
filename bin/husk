@@ -70,10 +70,36 @@ exclude_husk_dir() { # keep .husk/ out of git status without touching the repo
 }
 
 # ---------- config ----------
-load_conf() { # .husk.conf at repo root may set HUSK_DIRS / HUSK_MODE / HUSK_STORE / HUSK_REAP_DAYS
-  local root="$1"
-  # shellcheck disable=SC1091
-  [ -f "$root/.husk.conf" ] && . "$root/.husk.conf"
+load_conf() { # .husk.conf at repo root: KEY=VALUE lines, parsed - NEVER sourced.
+  # Agents run husk inside freshly cloned repos (AGENTS.md tells them to);
+  # sourcing would hand any repository arbitrary code execution on 'husk add'.
+  local root="$1" f="$1/.husk.conf" line k v
+  if [ -f "$f" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in \#*|"") continue ;; esac
+      line=${line#export }                    # tolerate old shell-style files
+      k=${line%%=*}; v=${line#*=}
+      k=$(printf '%s' "$k" | tr -d ' \t')
+      case "$v" in \"*\") v=${v%\"}; v=${v#\"} ;; \'*\') v=${v%\'}; v=${v#\'} ;; esac
+      # shellcheck disable=SC2088  # matching a LITERAL ~/ in the conf value is the point
+      case "$v" in "~/"*) v="$HOME/${v#"~/"}" ;; '$HOME/'*) v="$HOME/${v#'$HOME/'}" ;; esac
+      case "$k" in
+        HUSK_STORE) HUSK_STORE=$v ;;
+        HUSK_DIRS)  HUSK_DIRS=$v ;;
+        HUSK_MODE)
+          case "$v" in
+            auto|clone|hardlink|symlink|copy) HUSK_MODE=$v ;;
+            *) note ".husk.conf: invalid HUSK_MODE '$v' ignored" ;;
+          esac ;;
+        HUSK_REAP_DAYS|HUSK_DEDUPE|HUSK_NUDGE_SECS|HUSK_LOCK_TIMEOUT|HUSK_LOCK_TIMEOUT_BUSY)
+          case "$v" in
+            ''|*[!0-9]*) note ".husk.conf: non-numeric $k '$v' ignored" ;;
+            *) eval "$k=\$v" ;;   # k is one of the literal names above, v is digits
+          esac ;;
+        *) note ".husk.conf: ignoring unknown key: ${k:-<empty>}" ;;
+      esac
+    done < "$f"
+  fi
   store_guard "$root"
 }
 
@@ -151,16 +177,49 @@ store_base() { printf '%s/%s' "$HUSK_STORE" "$(repo_id)"; }
 entry_path() { printf '%s/%s/%s' "$(store_base)" "$1" "$2"; }  # dir key
 
 # ---------- locking (portable: no flock on macOS) ----------
+steal_lock() { # lockdir expected-dead-pid -> 0 stolen, 1 lost the race
+  # rename first (atomic, exactly one stealer wins), then verify the captured
+  # dir still holds the pid we judged dead. A plain rm -rf here would let a
+  # slow second stealer wipe the lock a THIRD process just legitimately
+  # acquired; with rename+verify the mistake is detectable and undone.
+  local lock="$1" dead="$2" got
+  mv "$lock" "$lock.stale.$$" 2>/dev/null || return 1
+  got=$(cat "$lock.stale.$$/pid" 2>/dev/null || echo "")
+  if [ "$got" != "$dead" ] && [ -n "$got" ] && kill -0 "$got" 2>/dev/null; then
+    # captured a LIVE holder's fresh lock by mistake: give it back
+    mv "$lock.stale.$$" "$lock" 2>/dev/null || rm -rf "$lock.stale.$$"
+    return 1
+  fi
+  rm -rf "$lock.stale.$$"
+  return 0
+}
+
 acquire_lock() { # lockdir
-  local lock="$1" waited=0 pid
+  local lock="$1" waited=0 pid age
   while ! mkdir "$lock" 2>/dev/null; do
     pid=$(cat "$lock/pid" 2>/dev/null || echo "")
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
       note "stealing stale lock (dead pid $pid): $lock"
-      rm -rf "$lock"
+      steal_lock "$lock" "$pid" || true
       continue
     fi
-    [ "$waited" -ge "$HUSK_LOCK_TIMEOUT" ] && die "timed out waiting for lock: $lock"
+    if [ -z "$pid" ]; then
+      # holder died between mkdir and writing its pid; steal once it's old
+      age=$(( $(date +%s) - $(mtime_of "$lock" 2>/dev/null || date +%s) ))
+      if [ "$age" -gt 30 ]; then
+        note "stealing pid-less lock (${age}s old): $lock"
+        steal_lock "$lock" "" || true
+        continue
+      fi
+    fi
+    if [ -n "$pid" ]; then
+      # live holder: it may legitimately be slow (an installer runs under the
+      # seed lock), so give it the long budget, not the 2-minute one
+      [ "$waited" -ge "${HUSK_LOCK_TIMEOUT_BUSY:-3600}" ] \
+        && die "timed out waiting for lock (live holder pid $pid): $lock"
+    else
+      [ "$waited" -ge "$HUSK_LOCK_TIMEOUT" ] && die "timed out waiting for lock: $lock"
+    fi
     sleep 1; waited=$((waited + 1))
   done
   echo $$ > "$lock/pid"
@@ -168,12 +227,14 @@ acquire_lock() { # lockdir
 }
 release_lock() { rm -rf "$1"; HUSK_CLEAN_LOCK=""; }
 
-# interruption safety: Ctrl-C or kill mid-seed must not strand a held lock
-# (siblings would stall until timeout/steal) or a half-built tmp dir.
+# interruption safety: Ctrl-C, kill, or hangup mid-seed must not strand a held
+# lock (siblings would stall until timeout/steal) or a half-built tmp dir.
 # Tracked globals are set while owned, cleared on clean handoff; the EXIT
 # trap sweeps whatever is still marked. rm_rf_safe is defined just below.
 HUSK_CLEAN_LOCK=""
 HUSK_CLEAN_TMP=""
+PROBE_CACHE_KEY=""
+PROBE_CACHE_VAL=""
 husk_cleanup() {
   [ -n "$HUSK_CLEAN_TMP" ] && rm_rf_safe "$HUSK_CLEAN_TMP" 2>/dev/null
   [ -n "$HUSK_CLEAN_LOCK" ] && rm -rf "$HUSK_CLEAN_LOCK" 2>/dev/null
@@ -182,6 +243,7 @@ husk_cleanup() {
 trap husk_cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # ---------- copy engines ----------
 rm_rf_safe() { # dir -> remove even when copies inherited a read-only root (mode 555):
@@ -255,7 +317,9 @@ plain_copy() { # src dst -> dst must not pre-exist (partial dst is removed, see 
 
 probe_mode() { # decide best mode: store entry -> worktree target fs
   local storefs="$1" wtfs="$2"
-  local probe="$storefs/.husk-probe" t="$wtfs/.husk-probe.$$"
+  # pid-unique names: a shared probe file lets two concurrent probes delete
+  # each other's file mid-ladder and silently downgrade both to copy mode
+  local probe="$storefs/.husk-probe.$$" t="$wtfs/.husk-probe.$$"
   [ "$HUSK_MODE" != "auto" ] && { printf '%s' "$HUSK_MODE"; return 0; }
   mkdir -p "$storefs" "$wtfs"
   echo probe > "$probe"
@@ -280,18 +344,27 @@ state_get() { # root dir -> "key mode" or empty
 }
 
 state_set() { # root dir key mode
-  local root="$1" sf tmp
+  # read-filter-rewrite under the state lock: two concurrent husk processes
+  # updating DIFFERENT dirs in the same worktree must not lose each other's
+  # row (a lost row makes gc think the entry is unreferenced)
+  local root="$1" sf tmp lock
   sf=$(state_file "$root"); tmp="$sf.tmp.$$"
   mkdir -p "$root/.husk"
+  lock="$sf.lock"
+  acquire_lock "$lock"
   { [ -f "$sf" ] && awk -F'\t' -v d="$2" '$1!=d' "$sf"; printf '%s\t%s\t%s\n' "$2" "$3" "$4"; } > "$tmp"
   mv "$tmp" "$sf"
+  release_lock "$lock"
 }
 
 state_del() { # root dir
-  local root="$1" sf tmp
+  local root="$1" sf tmp lock
   sf=$(state_file "$root"); [ -f "$sf" ] || return 0
   tmp="$sf.tmp.$$"
+  lock="$sf.lock"
+  acquire_lock "$lock"
   awk -F'\t' -v d="$2" '$1!=d' "$sf" > "$tmp" && mv "$tmp" "$sf"
+  release_lock "$lock"
 }
 
 add_ref() { # entry worktree-root
@@ -368,7 +441,7 @@ batch_link() { # listfile srcdir dstdir -> replace listed "./rel" paths with har
 }
 
 dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+perms+relpath
-  local entry="$1" sib="$2" live="${3:-0}" esig ssig list n=0 have rel f s
+  local entry="$1" sib="$2" live="${3:-0}" esig ssig list n=0 have rel f s guarded=0 linked=0
   esig=$(sig_file_for "$entry") || return 0
   ssig=$(sig_file_for "$sib")   || return 0
   list=$(mktemp "${TMPDIR:-/tmp}/husk-dd.XXXXXX") || return 0
@@ -387,14 +460,19 @@ dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+pe
       done < "$list"
     fi
   else
-    # published entry, possible concurrent readers: atomic per-file swap
+    # published entry, possible concurrent readers: atomic per-file swap.
+    # A symlink-mode entry root is write-guarded (a-w); lift it just for the
+    # swap so root-level files can dedupe too, then restore the guard.
+    if [ ! -w "$entry" ]; then guarded=1; chmod u+w "$entry" 2>/dev/null || true; fi
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
       f="$entry/$rel"; s="$sib/$rel"
       [ -f "$f" ] && [ ! -L "$f" ] && [ -f "$s" ] && [ ! -L "$s" ] || continue
       ln "$s" "$f.husk-dd.$$" 2>/dev/null || continue
-      mv -f "$f.husk-dd.$$" "$f" 2>/dev/null || rm -f "$f.husk-dd.$$"
+      if mv -f "$f.husk-dd.$$" "$f" 2>/dev/null; then linked=$((linked+1)); else rm -f "$f.husk-dd.$$"; fi
     done < "$list"
+    if [ "$guarded" = 1 ]; then chmod a-w "$entry" 2>/dev/null || true; fi
+    n=$linked   # report what actually happened, not the candidate count
   fi
   rm -f "$list"
   note "dedupe: $n files hardlinked to sibling entry"
@@ -405,6 +483,20 @@ dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+pe
 strip_meta() { # dir -> remove husk store metadata (must never ride along into a reseed
   # or a worktree: a stale inherited .husk-manifest would poison dedupe with old hashes)
   rm -f "$1/.husk-manifest" "$1/.husk-seeded" 2>/dev/null || true
+}
+
+publish_entry() { # tmp entry -> atomic publish; concede gracefully if entry appeared
+  # rename(2) onto an existing non-empty dir fails with ENOTEMPTY, so a raced
+  # double-publish can never nest one tmp dir INSIDE the winner's entry
+  # (which is what a plain 'mv' does when the target dir already exists)
+  local tmp="$1" entry="$2"
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'rename $ARGV[0], $ARGV[1] or exit 1' "$tmp" "$entry" 2>/dev/null && return 0
+    [ -d "$entry" ] && { rm_rf_safe "$tmp"; return 0; }   # lost the race: winner's copy serves
+  elif [ -d "$entry" ]; then
+    rm_rf_safe "$tmp"; return 0
+  fi
+  mv "$tmp" "$entry"
 }
 
 seed_entry_locked() { # source-real-dir entry -> seeds; caller MUST hold the entry lock
@@ -421,7 +513,7 @@ seed_entry_locked() { # source-real-dir entry -> seeds; caller MUST hold the ent
   fi
   sig_file_for "$tmp" >/dev/null 2>&1 || true   # cache manifest for future siblings
   date +%s > "$tmp/.husk-seeded" 2>/dev/null || true
-  mv "$tmp" "$entry"
+  publish_entry "$tmp" "$entry"
   HUSK_CLEAN_TMP=""
 }
 
@@ -437,8 +529,28 @@ seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if
 }
 
 # ---------- provisioning ----------
+swap_in() { # tmp target -> make tmp live at target, then discard the old tree.
+  # Rename the old target ASIDE first (instant) instead of rm -rf'ing it
+  # (seconds on a big tree): a crash mid-replace can no longer leave the
+  # worktree with no dependency dir at all. doctor sweeps .husk-old residue.
+  local tmp="$1" target="$2" old=""
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    old="$target.husk-old.$$"
+    rm_rf_safe "$old"
+    mv "$target" "$old" 2>/dev/null || { rm_rf_safe "$target"; old=""; }
+  fi
+  mv "$tmp" "$target" || return 1
+  [ -n "$old" ] && rm_rf_safe "$old"
+  return 0
+}
+
 provision() { # entry target mode
   local entry="$1" target="$2" mode="$3" tmp
+  # in-use stamp: a brand-new worktree's ref+state are written only AFTER
+  # provisioning, so a long copy from an old entry is invisible to gc's
+  # refcheck. The stamp (sibling file, never inside the write-guarded entry)
+  # buys the same 10-minute grace a fresh seed gets.
+  date +%s > "$entry.used" 2>/dev/null || true
   case "$mode" in
     clone)
       tmp="$target.husk-tmp.$$"
@@ -446,7 +558,7 @@ provision() { # entry target mode
       rm_rf_safe "$tmp"
       cow_clone "$entry" "$tmp" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       strip_meta "$tmp"
-      rm_rf_safe "$target"; mv "$tmp" "$target"
+      swap_in "$tmp" "$target" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;   # private copy: undo inherited write guard
     hardlink)
@@ -455,21 +567,22 @@ provision() { # entry target mode
       rm_rf_safe "$tmp"
       hardlink_farm "$entry" "$tmp" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       strip_meta "$tmp"
-      rm_rf_safe "$target"; mv "$tmp" "$target"
+      swap_in "$tmp" "$target" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;
     symlink)
       chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
       tmp="$target.husk-tmp.$$"
-      rm_rf_safe "$target"; rm -f "$tmp"
-      ln -s "$entry" "$tmp"; mv "$tmp" "$target" ;;
+      rm -f "$tmp"
+      ln -s "$entry" "$tmp"
+      swap_in "$tmp" "$target" || { rm -f "$tmp"; return 1; } ;;
     copy)
       tmp="$target.husk-tmp.$$"
       HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
       plain_copy "$entry" "$tmp" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       strip_meta "$tmp"
-      rm_rf_safe "$target"; mv "$tmp" "$target"
+      swap_in "$tmp" "$target" || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; return 1; }
       HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;
     *) die "unknown mode: $mode" ;;
@@ -509,7 +622,14 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
     return 2
   fi
   entry=$(entry_path "$dir" "$key")
-  mode=$(probe_mode "$(store_base)" "$root")
+  # memoized: a multi-dir link pays one filesystem probe, not one per dir
+  local pkey; pkey="$HUSK_MODE|$(store_base)|$root"
+  if [ "$PROBE_CACHE_KEY" = "$pkey" ]; then
+    mode=$PROBE_CACHE_VAL
+  else
+    mode=$(probe_mode "$(store_base)" "$root")
+    PROBE_CACHE_KEY=$pkey; PROBE_CACHE_VAL=$mode
+  fi
 
   # idempotence: already linked to the right entry?
   rec=$(state_get "$root" "$dir")
@@ -597,8 +717,12 @@ cmd_link() {
   root=$(repo_root); load_conf "$root"
   [ -n "${dirs// /}" ] || dirs=$(detect_dirs "$root")
   [ -n "${dirs// /}" ] || { note "nothing to link (no known dependency dirs or lockfiles found)"; return 0; }
+  local r
   for d in $dirs; do
-    link_one "$root" "$d" "$do_install" || rc=$?
+    r=0; link_one "$root" "$d" "$do_install" || r=$?
+    # severity: hard error (1) outranks needs-install (2) outranks ok,
+    # regardless of the order the dirs were processed in
+    case "$r:$rc" in *:1|1:*) rc=1 ;; *) [ "$r" -ne 0 ] && rc=$r ;; esac
   done
   return $rc
 }
@@ -630,7 +754,11 @@ cmd_add() {
     git worktree add $extra "$path"
   fi
 
-  ( cd "$path" && cmd_link $install_flag ) || true
+  # propagate the link result (2 = deps need install) instead of swallowing
+  # it: agents key off exit 2 to run 'husk link --install'
+  local link_rc=0
+  # shellcheck disable=SC2086
+  ( cd "$path" && cmd_link $install_flag ) || link_rc=$?
   out "worktree path=$(abspath "$path")"
 
   # opportunistic reap nudge (no daemon; fleet stays bounded). The probe walks
@@ -645,7 +773,7 @@ cmd_add() {
     stale=$(cmd_reap --dry-run --quiet | grep -c '^reap ' || true)
     [ "$stale" -gt 0 ] && note "$stale stale worktree(s) detected; run 'husk reap' to clean up"
   fi
-  return 0
+  return $link_rc
 }
 
 # ---------- unlink (materialize private copy) ----------
@@ -760,14 +888,17 @@ cmd_doctor() {
     pid=$(cat "$lock/pid" 2>/dev/null || echo "")
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
       issues=$((issues+1))
-      if [ $fix -eq 1 ]; then note "removing stale lock: $lock"; rm -rf "$lock"
+      if [ $fix -eq 1 ]; then
+        note "removing stale lock: $lock"
+        steal_lock "$lock" "$pid" || true   # rename+verify: never wipes a lock a live process just took
       else out "issue kind=stale-lock path=$lock fix='husk doctor --fix'"; fi
     fi
   done
-  # orphaned tmp residue from an interrupted seed (store) or provision (worktree).
-  # The pid is baked into the name; skip tmps whose owner is still running.
+  # orphaned tmp residue from an interrupted seed (store), provision or
+  # replace (worktree), or live-dedupe swap (store, .husk-dd files).
+  # The pid is baked into the name; skip residue whose owner is still running.
   local tmpd
-  for tmpd in "$(store_base)"/*/*.tmp.* "$root"/*.husk-tmp.*; do
+  for tmpd in "$(store_base)"/*/*.tmp.* "$root"/*.husk-tmp.* "$root"/*.husk-old.*; do
     [ -e "$tmpd" ] || [ -L "$tmpd" ] || continue
     pid=${tmpd##*.}
     case "$pid" in *[!0-9]*|'') pid="" ;; esac
@@ -778,6 +909,18 @@ cmd_doctor() {
       if [ -L "$tmpd" ]; then rm -f "$tmpd"; else rm_rf_safe "$tmpd"; fi
     else out "issue kind=tmp-residue path=$tmpd fix='husk doctor --fix'"; fi
   done
+  # live-dedupe swap residue can sit at any depth inside a store entry
+  while IFS= read -r tmpd; do
+    [ -n "$tmpd" ] || continue
+    pid=${tmpd##*.}
+    case "$pid" in *[!0-9]*|'') pid="" ;; esac
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
+    issues=$((issues+1))
+    if [ $fix -eq 1 ]; then note "removing dedupe residue: $tmpd"; rm -f "$tmpd"
+    else out "issue kind=tmp-residue path=$tmpd fix='husk doctor --fix'"; fi
+  done <<DDRES
+$(find "$(store_base)" -name '*.husk-dd.*' -type f 2>/dev/null)
+DDRES
   [ $issues -eq 0 ] && out "doctor ok=1" || out "doctor issues=$issues fixed=$fix"
 }
 
@@ -852,12 +995,22 @@ cmd_reap() {
 }
 
 # ---------- gc (drop unreferenced store entries) ----------
+wt_uses_key() { # worktree key -> 0 if the worktree's state records this key
+  [ -d "$1" ] && [ -f "$(state_file "$1")" ] \
+    && awk -F'\t' -v k="$2" '$2==k{found=1} END{exit !found}' "$(state_file "$1")" 2>/dev/null
+}
+
 cmd_gc() {
-  local dry=0 base entry refs live wt freed key now seeded
+  local dry=0 base entry refs live wt freed key now seeded used wt_list
   [ "${1:-}" = "--dry-run" ] && dry=1
   base=$(store_base)
   [ -d "$base" ] || { out "gc entries=0"; return 0; }
   now=$(date +%s)
+  # authoritative consumers: this repo's actual worktrees. The .refs files are
+  # advisory only - a process killed between state_set and add_ref leaves a
+  # live worktree with no ref, and trusting refs alone would delete an entry
+  # that worktree's symlink still points into.
+  wt_list=$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
   find "$base" -mindepth 2 -maxdepth 2 -type d ! -name '*.lock' ! -name '*.tmp.*' | while read -r entry; do
     # never touch an entry mid-seed (lock held) or younger than 10 minutes:
     # a sibling 'husk link' may have seeded it but not yet written its ref
@@ -865,23 +1018,52 @@ cmd_gc() {
     seeded=$(cat "$entry/.husk-seeded" 2>/dev/null || echo 0)
     case "$seeded" in *[!0-9]*|"") seeded=0 ;; esac
     [ $((now - seeded)) -lt 600 ] && continue
+    # ...or provisioned FROM recently: the consuming worktree's ref+state
+    # land only after the copy finishes, so honor the in-use stamp too
+    used=$(cat "$entry.used" 2>/dev/null || echo 0)
+    case "$used" in *[!0-9]*|"") used=0 ;; esac
+    [ $((now - used)) -lt 600 ] && continue
     refs="$entry.refs"
+    key=$(basename "$entry")
     live=0
     if [ -f "$refs" ]; then
-      key=$(basename "$entry")
       while read -r wt; do
-        [ -d "$wt" ] && [ -f "$(state_file "$wt")" ] \
-          && awk -F'\t' -v k="$key" '$2==k{found=1} END{exit !found}' "$(state_file "$wt")" 2>/dev/null \
-          && live=$((live+1))
+        wt_uses_key "$wt" "$key" && live=$((live+1))
       done < "$refs"
+    fi
+    if [ "$live" -eq 0 ] && [ -n "$wt_list" ]; then
+      while IFS= read -r wt; do
+        if wt_uses_key "$wt" "$key"; then
+          live=1
+          add_ref "$entry" "$wt"   # heal the missing ref while we're here
+          break
+        fi
+      done <<WTS
+$wt_list
+WTS
     fi
     if [ "$live" -eq 0 ]; then
       freed=$(du -sh "$entry" 2>/dev/null | cut -f1)
       if [ $dry -eq 1 ]; then
         out "gc-candidate entry=$entry size=$freed"
       else
+        # claim the entry lock (non-blocking: busy means a seeder owns it) and
+        # re-check the grace stamps UNDER the lock - a provision that started
+        # after our first look re-stamps .used and must not lose its source.
+        # If gc dies mid-delete the dead-pid lock is stolen/swept later.
+        mkdir "$entry.lock" 2>/dev/null || continue
+        echo $$ > "$entry.lock/pid"
+        used=$(cat "$entry.used" 2>/dev/null || echo 0)
+        case "$used" in *[!0-9]*|"") used=0 ;; esac
+        seeded=$(cat "$entry/.husk-seeded" 2>/dev/null || echo 0)
+        case "$seeded" in *[!0-9]*|"") seeded=0 ;; esac
+        now=$(date +%s)
+        if [ $((now - used)) -lt 600 ] || [ $((now - seeded)) -lt 600 ]; then
+          rm -rf "$entry.lock"; continue
+        fi
         chmod -R u+w "$entry" 2>/dev/null || true
-        rm -rf "$entry" "$refs"
+        rm -rf "$entry" "$refs" "$entry.used"
+        rm -rf "$entry.lock"
         out "gc-removed entry=$entry size=$freed"
       fi
     fi
@@ -891,7 +1073,8 @@ cmd_gc() {
 
 # ---------- dedupe (share identical files across existing store entries) ----------
 cmd_dedupe() {
-  local base dirp entry prev
+  local base dirp entry prev root
+  root=$(repo_root); load_conf "$root"
   base=$(store_base)
   [ -d "$base" ] || { out "dedupe entries=0"; return 0; }
   for dirp in "$base"/*; do
