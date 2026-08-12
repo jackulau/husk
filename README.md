@@ -41,12 +41,9 @@ the AGENTS.md edit.)
 
 Paste this to any coding agent (Claude Code, Cursor, etc.) working in your repo:
 
-> Install husk and set this repo up for cheap worktrees: run
-> `curl -fsSL https://raw.githubusercontent.com/jackulau/husk/main/install.sh | bash`,
-> make sure `~/.local/bin` is on PATH, then `cd` into the repo and run
-> `husk setup --write`. From now on create worktrees with `husk add <path> <branch>`
-> instead of `git worktree add`. If a husk command exits with code 2, run
-> `husk link --install`.
+```text
+Install husk and set this repo up for cheap worktrees: run curl -fsSL https://raw.githubusercontent.com/jackulau/husk/main/install.sh | bash, make sure ~/.local/bin is on PATH, then cd into the repo and run husk setup --write. From now on create worktrees with husk add <path> <branch> instead of git worktree add. If a husk command exits with code 2, run husk link --install.
+```
 
 `husk setup --write` is idempotent: it seeds the store from your installed deps and
 appends a marked instruction block to `AGENTS.md` (or `CLAUDE.md` if that's what the
