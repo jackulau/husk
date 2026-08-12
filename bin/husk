@@ -1,0 +1,717 @@
+#!/usr/bin/env bash
+# Copyright 2026 Jack Lau
+# SPDX-License-Identifier: Apache-2.0
+#
+# husk - storage-efficient git worktrees via content-keyed dependency sharing
+# Modes: clone (CoW, default where supported) | hardlink | symlink | copy
+# Portable: bash 3.2+, macOS + Linux. No dependencies beyond git + coreutils.
+set -euo pipefail
+
+HUSK_VERSION="0.1.0"
+HUSK_STORE="${HUSK_STORE:-$HOME/.husk/store}"
+HUSK_MODE="${HUSK_MODE:-auto}"
+HUSK_REAP_DAYS="${HUSK_REAP_DAYS:-7}"
+HUSK_LOCK_TIMEOUT="${HUSK_LOCK_TIMEOUT:-120}"
+
+KNOWN_DIRS="node_modules .venv venv target vendor Pods"
+
+# ---------- output conventions ----------
+# stdout: stable key=value lines (machine-readable)
+# stderr: human prose
+note() { printf 'husk: %s\n' "$*" >&2; }
+die()  { printf 'husk: error: %s\n' "$*" >&2; exit 1; }
+out()  { printf '%s\n' "$*"; }
+
+# ---------- portability helpers ----------
+sha256() { # stdin -> hash
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+  else sha256sum | cut -d' ' -f1; fi
+}
+
+mtime_of() { # file -> epoch seconds
+  if stat -f %m "$1" >/dev/null 2>&1; then stat -f %m "$1"
+  else stat -c %Y "$1"; fi
+}
+
+abspath() { (cd "$1" 2>/dev/null && pwd -P); }
+
+# ---------- repo context ----------
+repo_root() { git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"; }
+
+repo_common_dir() {
+  local c; c=$(git rev-parse --git-common-dir)
+  case "$c" in /*) ;; *) c="$(pwd)/$c" ;; esac
+  abspath "$c"
+}
+
+repo_id() { printf '%s' "$(repo_common_dir)" | sha256 | cut -c1-12; }
+
+main_worktree() { git worktree list --porcelain | head -1 | sed 's/^worktree //'; }
+
+exclude_husk_dir() { # keep .husk/ out of git status without touching the repo
+  local ex; ex=$(git rev-parse --git-path info/exclude 2>/dev/null) || return 0
+  mkdir -p "$(dirname "$ex")"
+  grep -qx '\.husk/' "$ex" 2>/dev/null || printf '.husk/\n' >> "$ex"
+}
+
+# ---------- config ----------
+load_conf() { # .husk.conf at repo root may set HUSK_DIRS / HUSK_MODE / HUSK_STORE / HUSK_REAP_DAYS
+  local root="$1"
+  # shellcheck disable=SC1091
+  [ -f "$root/.husk.conf" ] && . "$root/.husk.conf"
+  true
+}
+
+# ---------- lockfile mapping ----------
+lockfile_candidates() { # dep dir name -> ordered lockfile candidates
+  case "$1" in
+    node_modules) echo "package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lockb bun.lock" ;;
+    .venv|venv)   echo "uv.lock poetry.lock Pipfile.lock requirements.txt" ;;
+    target)       echo "Cargo.lock" ;;
+    vendor)       echo "Gemfile.lock composer.lock go.sum" ;;
+    Pods)         echo "Podfile.lock" ;;
+    *)            echo "" ;;
+  esac
+}
+
+manifest_candidates() { # fallback when no lockfile exists
+  case "$1" in
+    node_modules) echo "package.json" ;;
+    .venv|venv)   echo "pyproject.toml setup.py" ;;
+    target)       echo "Cargo.toml" ;;
+    vendor)       echo "Gemfile composer.json go.mod" ;;
+    Pods)         echo "Podfile" ;;
+    *)            echo "" ;;
+  esac
+}
+
+find_fingerprint_file() { # root dir -> path of first existing lockfile (or manifest), empty if none
+  local root="$1" dir="$2" f
+  for f in $(lockfile_candidates "$dir"); do
+    [ -f "$root/$f" ] && { printf '%s' "$root/$f"; return 0; }
+  done
+  for f in $(manifest_candidates "$dir"); do
+    [ -f "$root/$f" ] && { printf '%s' "$root/$f"; return 0; }
+  done
+  printf ''
+}
+
+key_for() { # root dir -> content key (or empty if unfingerprintable)
+  local root="$1" dir="$2" fp
+  fp=$(find_fingerprint_file "$root" "$dir")
+  [ -n "$fp" ] || { printf ''; return 0; }
+  { printf '%s\n%s-%s\n' "$dir" "$(uname -s)" "$(uname -m)"; cat "$fp"; } | sha256 | cut -c1-16
+}
+
+detect_dirs() { # root -> dep dirs relevant to this repo (exists OR its lockfile exists)
+  local root="$1" d found=""
+  if [ -n "${HUSK_DIRS:-}" ]; then printf '%s' "$HUSK_DIRS"; return 0; fi
+  for d in $KNOWN_DIRS; do
+    # claim the dir if it exists, or a lockfile/manifest maps to it
+    if [ -e "$root/$d" ] || [ -n "$(find_fingerprint_file "$root" "$d")" ]; then
+      found="$found $d"
+    fi
+  done
+  printf '%s' "$found"
+}
+
+# ---------- store ----------
+store_base() { printf '%s/%s' "$HUSK_STORE" "$(repo_id)"; }
+entry_path() { printf '%s/%s/%s' "$(store_base)" "$1" "$2"; }  # dir key
+
+# ---------- locking (portable: no flock on macOS) ----------
+acquire_lock() { # lockdir
+  local lock="$1" waited=0 pid
+  while ! mkdir "$lock" 2>/dev/null; do
+    pid=$(cat "$lock/pid" 2>/dev/null || echo "")
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      note "stealing stale lock (dead pid $pid): $lock"
+      rm -rf "$lock"
+      continue
+    fi
+    [ "$waited" -ge "$HUSK_LOCK_TIMEOUT" ] && die "timed out waiting for lock: $lock"
+    sleep 1; waited=$((waited + 1))
+  done
+  echo $$ > "$lock/pid"
+}
+release_lock() { rm -rf "$1"; }
+
+# ---------- copy engines ----------
+cow_clone() { # src dst -> 0 if CoW clone succeeded
+  if cp -c -R "$1" "$2" 2>/dev/null; then return 0; fi          # macOS APFS clonefile
+  if cp -R --reflink=always "$1" "$2" 2>/dev/null; then return 0; fi  # btrfs/xfs
+  return 1
+}
+
+hardlink_farm() { # src dst
+  if cp -al "$1" "$2" 2>/dev/null; then return 0; fi            # GNU cp
+  if command -v pax >/dev/null 2>&1; then
+    mkdir -p "$2" && (cd "$1" && pax -rwl . "$(cd "$2" && pwd)") 2>/dev/null && return 0
+    rm -rf "$2"
+  fi
+  return 1
+}
+
+plain_copy() { cp -Rp "$1" "$2"; }
+
+probe_mode() { # decide best mode: store entry -> worktree target fs
+  local storefs="$1" wtfs="$2"
+  local probe="$storefs/.husk-probe" t="$wtfs/.husk-probe.$$"
+  [ "$HUSK_MODE" != "auto" ] && { printf '%s' "$HUSK_MODE"; return 0; }
+  mkdir -p "$storefs" "$wtfs"
+  echo probe > "$probe"
+  if cow_clone "$probe" "$t"; then rm -f "$t" "$probe"; printf 'clone'; return 0; fi
+  if ln "$probe" "$t" 2>/dev/null; then rm -f "$t" "$probe"; printf 'hardlink'; return 0; fi
+  rm -f "$probe"
+  printf 'symlink'
+}
+
+# ---------- worktree state (.husk/state: dir<TAB>key<TAB>mode) ----------
+state_file() { printf '%s/.husk/state' "$1"; }
+
+state_get() { # root dir -> "key mode" or empty
+  local sf; sf=$(state_file "$1")
+  [ -f "$sf" ] || return 0
+  awk -F'\t' -v d="$2" '$1==d {print $2, $3}' "$sf"
+}
+
+state_set() { # root dir key mode
+  local root="$1" sf tmp
+  sf=$(state_file "$root"); tmp="$sf.tmp.$$"
+  mkdir -p "$root/.husk"
+  { [ -f "$sf" ] && awk -F'\t' -v d="$2" '$1!=d' "$sf"; printf '%s\t%s\t%s\n' "$2" "$3" "$4"; } > "$tmp"
+  mv "$tmp" "$sf"
+}
+
+state_del() { # root dir
+  local root="$1" sf tmp
+  sf=$(state_file "$root"); [ -f "$sf" ] || return 0
+  tmp="$sf.tmp.$$"
+  awk -F'\t' -v d="$2" '$1!=d' "$sf" > "$tmp" && mv "$tmp" "$sf"
+}
+
+add_ref() { # entry worktree-root
+  local refs="$1.refs"
+  grep -qxF "$2" "$refs" 2>/dev/null || printf '%s\n' "$2" >> "$refs"
+}
+
+del_ref() { # entry worktree-root
+  local refs="$1.refs" tmp
+  [ -f "$refs" ] || return 0
+  tmp="$refs.tmp.$$"
+  grep -vxF "$2" "$refs" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$refs"
+}
+
+# ---------- seeding ----------
+seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if exists)
+  local src="$1" entry="$2" parent lock tmp
+  [ -d "$entry" ] && return 0
+  parent=$(dirname "$entry"); mkdir -p "$parent"
+  lock="$entry.lock"
+  acquire_lock "$lock"
+  if [ -d "$entry" ]; then release_lock "$lock"; return 0; fi  # raced, winner seeded
+  tmp="$entry.tmp.$$"
+  rm -rf "$tmp"
+  if cow_clone "$src" "$tmp"; then :; else plain_copy "$src" "$tmp"; fi
+  date +%s > "$tmp/.husk-seeded" 2>/dev/null || true
+  mv "$tmp" "$entry"
+  release_lock "$lock"
+}
+
+# ---------- provisioning ----------
+provision() { # entry target mode
+  local entry="$1" target="$2" mode="$3" tmp
+  case "$mode" in
+    clone)
+      tmp="$target.husk-tmp.$$"
+      rm -rf "$tmp"
+      cow_clone "$entry" "$tmp" || { rm -rf "$tmp"; return 1; }
+      rm -rf "$target"; mv "$tmp" "$target"
+      chmod u+w "$target" 2>/dev/null || true ;;   # private copy: undo inherited write guard
+    hardlink)
+      tmp="$target.husk-tmp.$$"
+      rm -rf "$tmp"
+      hardlink_farm "$entry" "$tmp" || { rm -rf "$tmp"; return 1; }
+      rm -rf "$target"; mv "$tmp" "$target"
+      chmod u+w "$target" 2>/dev/null || true ;;
+    symlink)
+      chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
+      tmp="$target.husk-tmp.$$"
+      rm -rf "$target" "$tmp"
+      ln -s "$entry" "$tmp"; mv "$tmp" "$target" ;;
+    copy)
+      tmp="$target.husk-tmp.$$"
+      rm -rf "$tmp"
+      plain_copy "$entry" "$tmp"
+      rm -rf "$target"; mv "$tmp" "$target"
+      chmod u+w "$target" 2>/dev/null || true ;;
+    *) die "unknown mode: $mode" ;;
+  esac
+}
+
+# ---------- installer detection ----------
+run_install() { # root dir -> run the ecosystem's installer inside root
+  local root="$1" dir="$2"
+  ( cd "$root"
+    case "$dir" in
+      node_modules)
+        if   [ -f pnpm-lock.yaml ];      then pnpm install --frozen-lockfile
+        elif [ -f bun.lockb ] || [ -f bun.lock ]; then bun install --frozen-lockfile
+        elif [ -f yarn.lock ];           then yarn install --immutable 2>/dev/null || yarn install --frozen-lockfile
+        elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then npm ci
+        elif [ -f package.json ];        then npm install
+        else return 1; fi ;;
+      .venv|venv)
+        if   [ -f uv.lock ]; then uv sync
+        elif [ -f poetry.lock ]; then poetry install
+        elif [ -f requirements.txt ]; then python3 -m venv "$dir" && "./$dir/bin/pip" install -r requirements.txt
+        else return 1; fi ;;
+      *) note "no installer mapping for '$dir'; build it yourself, then re-run 'husk link'"; return 1 ;;
+    esac )
+}
+
+# ---------- link (the core verb) ----------
+link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
+  local root="$1" dir="$2" do_install="$3"
+  local key entry mode donor target rec
+
+  target="$root/$dir"
+  key=$(key_for "$root" "$dir")
+  if [ -z "$key" ]; then
+    note "$dir: no lockfile or manifest to fingerprint; refusing to share (use your installer directly)"
+    return 2
+  fi
+  entry=$(entry_path "$dir" "$key")
+  mode=$(probe_mode "$(store_base)" "$root")
+
+  # idempotence: already linked to the right entry?
+  rec=$(state_get "$root" "$dir")
+  if [ -n "$rec" ] && [ "${rec%% *}" = "$key" ]; then
+    if [ -L "$target" ] && [ "$(readlink "$target")" = "$entry" ] && [ -d "$entry" ]; then
+      out "linked dir=$dir mode=symlink key=$key entry=$entry (already)"
+      return 0
+    fi
+    if [ ! -L "$target" ] && [ -d "$target" ] && [ -d "$entry" ] && [ "${rec##* }" != "symlink" ]; then
+      out "linked dir=$dir mode=${rec##* } key=$key entry=$entry (already)"
+      return 0
+    fi
+  fi
+
+  # source of truth for seeding, in preference order:
+  # 1. this worktree already has a real dir (agent ran the installer here).
+  #    ONLY trusted when husk has no record for it (virgin install) or the record
+  #    matches the current key - a recorded key mismatch means the dir is a stale
+  #    relic of the OLD lockfile and must not seed the new key.
+  if [ -d "$target" ] && [ ! -L "$target" ]; then
+    if [ -z "$rec" ] || [ "${rec%% *}" = "$key" ]; then
+      seed_entry "$target" "$entry"
+    fi
+  fi
+  # 2. donor (main worktree) has a real dir whose lockfile matches ours
+  if [ ! -d "$entry" ]; then
+    donor=$(main_worktree)
+    if [ -n "$donor" ] && [ "$donor" != "$root" ] && [ -d "$donor/$dir" ] && [ ! -L "$donor/$dir" ]; then
+      if [ "$(key_for "$donor" "$dir")" = "$key" ]; then
+        seed_entry "$donor/$dir" "$entry"
+      fi
+    fi
+  fi
+  # 3. run the installer (opt-in), then seed from the result
+  if [ ! -d "$entry" ] && [ "$do_install" = "1" ]; then
+    note "$dir: store miss; running installer"
+    run_install "$root" "$dir" || die "$dir: installer failed"
+    [ -d "$target" ] || die "$dir: installer did not produce $target"
+    seed_entry "$target" "$entry"
+  fi
+
+  if [ ! -d "$entry" ]; then
+    out "miss dir=$dir key=$key"
+    note "$dir: no store entry and no matching donor; run 'husk link --install', or install deps yourself then 'husk adopt' + 'husk link'"
+    return 2
+  fi
+
+  # provision (skip when target IS the seed source and mode keeps real dirs:
+  # a real dir that just seeded the store already shares blocks via CoW)
+  if [ -d "$target" ] && [ ! -L "$target" ] && { [ "$mode" = "clone" ] || [ "$mode" = "hardlink" ]; }; then
+    :
+  else
+    provision "$entry" "$target" "$mode" || {
+      note "$dir: $mode provisioning failed; falling back to copy"
+      mode=copy
+      provision "$entry" "$target" "$mode"
+    }
+  fi
+
+  state_set "$root" "$dir" "$key" "$mode"
+  add_ref "$entry" "$root"
+  exclude_husk_dir
+  out "linked dir=$dir mode=$mode key=$key entry=$entry"
+  return 0
+}
+
+cmd_link() {
+  local do_install=0 dirs="" root rc=0 d
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --install) do_install=1 ;;
+      --mode) shift; HUSK_MODE="$1" ;;
+      --mode=*) HUSK_MODE="${1#--mode=}" ;;
+      -*) die "unknown flag for link: $1" ;;
+      *) dirs="$dirs $1" ;;
+    esac; shift
+  done
+  root=$(repo_root); load_conf "$root"
+  [ -n "${dirs// /}" ] || dirs=$(detect_dirs "$root")
+  [ -n "${dirs// /}" ] || { note "nothing to link (no known dependency dirs or lockfiles found)"; return 0; }
+  for d in $dirs; do
+    link_one "$root" "$d" "$do_install" || rc=$?
+  done
+  return $rc
+}
+
+# ---------- add ----------
+cmd_add() {
+  local path="" branch="" extra="" install_flag=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --install) install_flag="--install" ;;
+      --mode|--mode=*) case "$1" in --mode) shift; HUSK_MODE="$1";; *) HUSK_MODE="${1#--mode=}";; esac ;;
+      -*) extra="$extra $1" ;;
+      *) if [ -z "$path" ]; then path="$1"; elif [ -z "$branch" ]; then branch="$1"; else extra="$extra $1"; fi ;;
+    esac; shift
+  done
+  [ -n "$path" ] || die "usage: husk add <path> [branch]"
+  repo_root >/dev/null
+
+  if [ -n "$branch" ]; then
+    if git show-ref --verify --quiet "refs/heads/$branch"; then
+      # shellcheck disable=SC2086
+      git worktree add $extra "$path" "$branch"
+    else
+      # shellcheck disable=SC2086
+      git worktree add $extra -b "$branch" "$path"
+    fi
+  else
+    # shellcheck disable=SC2086
+    git worktree add $extra "$path"
+  fi
+
+  ( cd "$path" && cmd_link $install_flag ) || true
+  out "worktree path=$(abspath "$path")"
+
+  # opportunistic reap nudge (no daemon; fleet stays bounded)
+  local stale
+  stale=$(cmd_reap --dry-run --quiet | grep -c '^reap ' || true)
+  [ "$stale" -gt 0 ] && note "$stale stale worktree(s) detected; run 'husk reap' to clean up"
+  return 0
+}
+
+# ---------- unlink (materialize private copy) ----------
+cmd_unlink() {
+  local root dirs="" d rec key mode entry target tmp
+  root=$(repo_root); load_conf "$root"
+  [ $# -gt 0 ] && dirs="$*" || dirs=$(awk -F'\t' '{print $1}' "$(state_file "$root")" 2>/dev/null || true)
+  [ -n "${dirs// /}" ] || { note "nothing linked"; return 0; }
+  for d in $dirs; do
+    rec=$(state_get "$root" "$d"); [ -n "$rec" ] || { note "$d: not linked, skipping"; continue; }
+    key="${rec%% *}"; mode="${rec##* }"
+    entry=$(entry_path "$d" "$key")
+    target="$root/$d"
+    if [ -L "$target" ]; then
+      tmp="$target.husk-tmp.$$"
+      rm -rf "$tmp"
+      if [ -d "$entry" ]; then
+        cow_clone "$entry" "$tmp" || plain_copy "$entry" "$tmp"
+      else
+        note "$d: store entry gone; nothing to materialize from"
+        rm -f "$target"; state_del "$root" "$d"; del_ref "$entry" "$root"
+        out "unlinked dir=$d materialized=0"
+        continue
+      fi
+      rm -f "$target"; mv "$tmp" "$target"
+    fi
+    [ -d "$target" ] && chmod u+w "$target" 2>/dev/null || true
+    state_del "$root" "$d"
+    del_ref "$entry" "$root"
+    out "unlinked dir=$d materialized=1"
+  done
+}
+
+# ---------- adopt (seed store from this checkout) ----------
+cmd_adopt() {
+  local root d key entry
+  root=$(repo_root); load_conf "$root"
+  for d in $(detect_dirs "$root"); do
+    [ -d "$root/$d" ] && [ ! -L "$root/$d" ] || continue
+    key=$(key_for "$root" "$d"); [ -n "$key" ] || { note "$d: unfingerprintable, skipping"; continue; }
+    entry=$(entry_path "$d" "$key")
+    seed_entry "$root/$d" "$entry"
+    out "adopted dir=$d key=$key entry=$entry"
+  done
+}
+
+# ---------- status ----------
+cmd_status() {
+  local root sf base d key mode entry ok stale
+  root=$(repo_root); load_conf "$root"
+  base=$(store_base)
+  out "worktree=$root"
+  out "store=$base"
+  sf=$(state_file "$root")
+  if [ -f "$sf" ]; then
+    while IFS=$(printf '\t') read -r d key mode; do
+      entry=$(entry_path "$d" "$key")
+      ok=ok
+      [ -d "$entry" ] || ok=missing-entry
+      if [ "$mode" = "symlink" ] && [ ! -L "$root/$d" ]; then ok=not-a-link; fi
+      if [ -L "$root/$d" ] && [ ! -e "$root/$d" ]; then ok=dangling; fi
+      stale=""
+      [ "$(key_for "$root" "$d")" != "$key" ] && stale=" drift=lockfile-changed"
+      out "dep dir=$d mode=$mode key=$key state=$ok$stale"
+    done < "$sf"
+  else
+    out "dep none"
+  fi
+  if [ -d "$base" ]; then
+    out "store_size=$(du -sh "$base" 2>/dev/null | cut -f1)"
+    out "store_entries=$(find "$base" -mindepth 2 -maxdepth 2 -type d ! -name '*.lock' ! -name '*.tmp.*' 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+}
+
+# ---------- doctor ----------
+cmd_doctor() {
+  local fix=0 root sf d key mode entry issues=0
+  [ "${1:-}" = "--fix" ] && fix=1
+  root=$(repo_root); load_conf "$root"
+  sf=$(state_file "$root")
+  if [ -f "$sf" ]; then
+    while IFS=$(printf '\t') read -r d key mode; do
+      entry=$(entry_path "$d" "$key")
+      # dangling link
+      if [ -L "$root/$d" ] && [ ! -e "$root/$d" ]; then
+        issues=$((issues+1))
+        if [ $fix -eq 1 ]; then
+          note "$d: dangling link; re-linking (mode $mode)"
+          rm -f "$root/$d"; state_del "$root" "$d"
+          ( cd "$root" && cmd_link --mode "$mode" "$d" ) || note "$d: re-link failed (store entry gone? try --install)"
+        else
+          out "issue dir=$d kind=dangling-link fix='husk doctor --fix'"
+        fi
+      fi
+      # lockfile drift
+      if [ -n "$key" ] && [ "$(key_for "$root" "$d")" != "$key" ]; then
+        issues=$((issues+1))
+        if [ $fix -eq 1 ]; then
+          note "$d: lockfile drifted; re-keying (mode $mode)"
+          ( cd "$root" && cmd_link --mode "$mode" "$d" ) || true
+        else
+          out "issue dir=$d kind=lockfile-drift fix='husk link $d' (re-key) or 'husk unlink $d' (go private)"
+        fi
+      fi
+    done < "$sf"
+  fi
+  # stale locks in store
+  local lock pid
+  for lock in "$(store_base)"/*/*.lock; do
+    [ -d "$lock" ] || continue
+    pid=$(cat "$lock/pid" 2>/dev/null || echo "")
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+      issues=$((issues+1))
+      if [ $fix -eq 1 ]; then note "removing stale lock: $lock"; rm -rf "$lock"
+      else out "issue kind=stale-lock path=$lock fix='husk doctor --fix'"; fi
+    fi
+  done
+  [ $issues -eq 0 ] && out "doctor ok=1" || out "doctor issues=$issues fixed=$fix"
+}
+
+# ---------- reap (stale worktree cleanup) ----------
+default_branch() {
+  local b
+  b=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@.*/@@') || true
+  [ -n "${b:-}" ] && { printf '%s' "$b"; return 0; }
+  for b in main master; do
+    git show-ref --verify --quiet "refs/heads/$b" && { printf '%s' "$b"; return 0; }
+  done
+  git symbolic-ref --short HEAD 2>/dev/null || printf 'main'
+}
+
+cmd_reap() {
+  local dry=0 quiet=0 days="$HUSK_REAP_DAYS" root main def now wt br head idx age merged gone reason
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --quiet) quiet=1 ;;
+      --days) shift; days="$1" ;;
+      --days=*) days="${1#--days=}" ;;
+      *) die "unknown flag for reap: $1" ;;
+    esac; shift
+  done
+  root=$(repo_root); load_conf "$root"
+  main=$(main_worktree); def=$(default_branch); now=$(date +%s)
+
+  git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | while read -r wt; do
+    [ "$wt" = "$main" ] && continue
+    [ "$wt" = "$root" ] && continue                       # never reap where we stand
+    [ -d "$wt" ] || continue
+    # clean?
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then continue; fi
+    # age: last activity = max(worktree HEAD-file mtime, last commit time).
+    # NOT the index mtime - 'git status' (incl. our own clean check) refreshes it.
+    idx=$(git -C "$wt" rev-parse --git-dir 2>/dev/null || echo "$wt/.git")
+    local act1 act2 activity
+    act1=$(mtime_of "$idx/HEAD" 2>/dev/null || echo "$now")
+    act2=$(git -C "$wt" log -1 --format=%ct 2>/dev/null || echo "$now")
+    activity=$act1; [ "$act2" -gt "$activity" ] && activity=$act2
+    age=$(( (now - activity) / 86400 ))
+    [ "$age" -lt "$days" ] && continue
+    # merged or upstream gone?
+    br=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+    head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
+    merged=0; gone=0
+    [ -n "$head" ] && git merge-base --is-ancestor "$head" "refs/heads/$def" 2>/dev/null && merged=1
+    if [ -n "$br" ] && [ -n "$(git config "branch.$br.remote" 2>/dev/null || true)" ]; then
+      git -C "$wt" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 || gone=1
+    fi
+    [ $merged -eq 1 ] || [ $gone -eq 1 ] || continue
+    reason=merged; [ $gone -eq 1 ] && reason=upstream-gone
+    if [ $dry -eq 1 ]; then
+      out "reap worktree=$wt branch=${br:-detached} reason=$reason age_days=$age"
+    else
+      [ $quiet -eq 0 ] && note "reaping $wt (${br:-detached}, $reason, ${age}d idle)"
+      # deref store entries this worktree used
+      local sf d k _m e
+      sf=$(state_file "$wt")
+      if [ -f "$sf" ]; then
+        while IFS=$(printf '\t') read -r d k _m; do
+          e=$(entry_path "$d" "$k"); del_ref "$e" "$wt"
+        done < "$sf"
+      fi
+      git worktree remove --force "$wt" 2>/dev/null || git worktree remove "$wt"
+      [ -n "$br" ] && [ "$br" != "$def" ] && git branch -d "$br" 2>/dev/null || true
+      out "reaped worktree=$wt branch=${br:-detached} reason=$reason"
+    fi
+  done
+  return 0
+}
+
+# ---------- gc (drop unreferenced store entries) ----------
+cmd_gc() {
+  local dry=0 base entry refs live wt freed key
+  [ "${1:-}" = "--dry-run" ] && dry=1
+  base=$(store_base)
+  [ -d "$base" ] || { out "gc entries=0"; return 0; }
+  find "$base" -mindepth 2 -maxdepth 2 -type d ! -name '*.lock' ! -name '*.tmp.*' | while read -r entry; do
+    refs="$entry.refs"
+    live=0
+    if [ -f "$refs" ]; then
+      key=$(basename "$entry")
+      while read -r wt; do
+        [ -d "$wt" ] && [ -f "$(state_file "$wt")" ] \
+          && awk -F'\t' -v k="$key" '$2==k{found=1} END{exit !found}' "$(state_file "$wt")" 2>/dev/null \
+          && live=$((live+1))
+      done < "$refs"
+    fi
+    if [ "$live" -eq 0 ]; then
+      freed=$(du -sh "$entry" 2>/dev/null | cut -f1)
+      if [ $dry -eq 1 ]; then
+        out "gc-candidate entry=$entry size=$freed"
+      else
+        chmod -R u+w "$entry" 2>/dev/null || true
+        rm -rf "$entry" "$refs"
+        out "gc-removed entry=$entry size=$freed"
+      fi
+    fi
+  done
+  return 0
+}
+
+# ---------- setup (agent adoption: adopt + instructions) ----------
+agent_snippet() {
+  cat <<'EOF'
+<!-- husk:agent-instructions -->
+## Worktrees (husk)
+- Create worktrees with `husk add <path> <branch>` instead of `git worktree add` — dependencies are provisioned instantly from a shared store.
+- If any husk command exits with code 2, run `husk link --install` inside that worktree.
+- After changing a lockfile and reinstalling deps, run `husk adopt` so sibling worktrees can share the result.
+- Periodically run `husk reap` (removes only clean + merged + idle worktrees) and `husk gc`.
+- `husk status` to inspect, `husk doctor --fix` to repair. Never delete `~/.husk/store`.
+<!-- /husk:agent-instructions -->
+EOF
+}
+
+cmd_setup() {
+  local write=0 root target
+  [ "${1:-}" = "--write" ] && write=1
+  root=$(repo_root); load_conf "$root"
+  cmd_adopt
+  if [ $write -eq 1 ]; then
+    target="$root/AGENTS.md"
+    [ ! -f "$target" ] && [ -f "$root/CLAUDE.md" ] && target="$root/CLAUDE.md"
+    if [ -f "$target" ] && grep -q 'husk:agent-instructions' "$target"; then
+      out "setup instructions=already-present file=$target"
+    else
+      { [ -f "$target" ] && [ -s "$target" ] && printf '\n'; agent_snippet; } >> "$target"
+      out "setup instructions=written file=$target"
+    fi
+  else
+    agent_snippet
+    note "add the block above to your AGENTS.md / CLAUDE.md (or re-run: husk setup --write)"
+  fi
+}
+
+# ---------- help ----------
+usage() {
+  cat <<'EOF'
+husk - storage-efficient git worktrees (share heavy dependency dirs safely)
+
+USAGE
+  husk add <path> [branch] [--install] [--mode M]   create worktree + link deps (one verb)
+  husk link [dir...] [--install] [--mode M]         link/provision dep dirs in current worktree
+  husk unlink [dir...]                              materialize a private copy, stop sharing
+  husk adopt                                        seed the store from this checkout's real dirs
+  husk setup [--write]                              adopt + agent instructions (--write appends to AGENTS.md/CLAUDE.md)
+  husk status                                       link states, drift, store size
+  husk doctor [--fix]                               find/repair dangling links, drift, stale locks
+  husk reap [--dry-run] [--days N]                  delete stale worktrees (clean+merged+idle)
+  husk gc [--dry-run]                               drop unreferenced store entries
+
+MODES (--mode or HUSK_MODE; default: auto)
+  auto      probe filesystem: clone > hardlink > symlink
+  clone     CoW clone (APFS/btrfs/XFS) - full isolation, bytes shared until divergence
+  hardlink  hardlink farm - file-level dedupe, near-full isolation
+  symlink   link to shared store entry - maximal dedupe, shared writes (guarded read-only root)
+  copy      plain copy - always correct, no savings
+
+ENV
+  HUSK_STORE      store location (default ~/.husk/store)
+  HUSK_MODE       default mode (default auto)
+  HUSK_REAP_DAYS  reap idle threshold (default 7)
+
+Config file: .husk.conf at repo root (shell syntax: HUSK_DIRS="node_modules .venv" etc.)
+Output: stdout is stable key=value lines; humans read stderr.
+Exit codes: 0 ok - 2 needs install - 1 error
+EOF
+}
+
+# ---------- main ----------
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    link)    cmd_link "$@" ;;
+    add)     cmd_add "$@" ;;
+    unlink)  cmd_unlink "$@" ;;
+    adopt)   cmd_adopt "$@" ;;
+    setup)   cmd_setup "$@" ;;
+    status)  cmd_status "$@" ;;
+    doctor)  cmd_doctor "$@" ;;
+    reap)    cmd_reap "$@" ;;
+    gc)      cmd_gc "$@" ;;
+    version|--version) out "husk $HUSK_VERSION" ;;
+    ""|help|--help|-h) usage ;;
+    *) die "unknown command: $cmd (try 'husk --help')" ;;
+  esac
+}
+
+main "$@"
