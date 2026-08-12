@@ -34,8 +34,10 @@ mtime_of() { # file -> epoch seconds
 }
 
 batch_hash() { # stdin: NUL-separated paths -> "HASH  path" lines
-  if command -v shasum >/dev/null 2>&1; then xargs -0 shasum -a 256 2>/dev/null
-  else xargs -0 sha256sum 2>/dev/null; fi
+  # openssl and sha256sum are C implementations; shasum is perl (~8x slower)
+  if openssl sha256 -r /dev/null >/dev/null 2>&1; then xargs -0 openssl sha256 -r 2>/dev/null
+  elif command -v sha256sum >/dev/null 2>&1; then xargs -0 sha256sum 2>/dev/null
+  else xargs -0 shasum -a 256 2>/dev/null; fi
 }
 
 batch_perms() { # tree -> "PERMS path" lines (batched stat, few forks)
@@ -239,7 +241,7 @@ tree_sig() { # tree -> sorted "hash<TAB>perms<TAB>relpath" lines (two batched pa
   local tree="$1" th tp
   th=$(mktemp "${TMPDIR:-/tmp}/husk-sig.XXXXXX") || return 1
   tp=$(mktemp "${TMPDIR:-/tmp}/husk-sig.XXXXXX") || { rm -f "$th"; return 1; }
-  ( cd "$tree" && find . -type f ! -name .husk-seeded ! -name .husk-manifest -print0 | batch_hash ) \
+  ( cd "$tree" && find . -type f ! -name '.husk-*' -print0 | batch_hash ) \
     | awk '{h=$1; sub(/^[^ ]+ [ *]?/,""); print $0 "\t" h}' > "$th"
   ( cd "$tree" && batch_perms . ) \
     | awk '{p=$1; sub(/^[^ ]+ /,""); print $0 "\t" p}' > "$tp"
@@ -259,7 +261,17 @@ sig_file_for() { # tree -> path to a signature file, caching as .husk-manifest w
   tree_sig "$tree" > "$t" && printf '%s' "$t"
 }
 
-batch_link() { # listfile srcdir dstdir -> hardlink listed "./rel" paths in bulk
+batch_link() { # listfile srcdir dstdir -> replace listed "./rel" paths with hardlinks, in bulk
+  # perl: one process, one link(2) per file (cpio/pax fork-free too but ~50x slower on macOS)
+  if command -v perl >/dev/null 2>&1; then
+    perl -e '
+      my ($list, $src, $dst) = @ARGV;
+      open my $fh, "<", $list or exit 1;
+      while (<$fh>) { chomp; next unless length;
+        unlink "$dst/$_"; link "$src/$_", "$dst/$_"; }
+    ' "$1" "$2" "$3" 2>/dev/null && return 0
+  fi
+  ( cd "$3" && tr '\n' '\0' < "$1" | xargs -0 rm -f -- ) 2>/dev/null
   if command -v cpio >/dev/null 2>&1; then
     ( cd "$2" && cpio -pdl "$3" < "$1" ) 2>/dev/null && return 0
   fi
@@ -267,7 +279,7 @@ batch_link() { # listfile srcdir dstdir -> hardlink listed "./rel" paths in bulk
 }
 
 dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+perms+relpath
-  local entry="$1" sib="$2" live="${3:-0}" esig ssig list n=0 rel f s
+  local entry="$1" sib="$2" live="${3:-0}" esig ssig list n=0 have rel f s
   esig=$(sig_file_for "$entry") || return 0
   ssig=$(sig_file_for "$sib")   || return 0
   list=$(mktemp "${TMPDIR:-/tmp}/husk-dd.XXXXXX") || return 0
@@ -275,14 +287,16 @@ dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+pe
   n=$(grep -c . "$list" || true)
   if [ "$n" -eq 0 ]; then rm -f "$list"; return 0; fi
   if [ "$live" = "0" ]; then
-    # unpublished tmp entry, no readers: bulk remove + bulk hardlink (O(1) forks),
+    # unpublished tmp entry, no readers: bulk replace-with-hardlink (O(1) forks),
     # then heal any miss from the sibling (same content by definition)
-    ( cd "$entry" && tr '\n' '\0' < "$list" | xargs -0 rm -f -- ) 2>/dev/null
     batch_link "$list" "$sib" "$entry" || true
-    while IFS= read -r rel; do
-      [ -n "$rel" ] && [ ! -f "$entry/$rel" ] || continue
-      ln "$sib/$rel" "$entry/$rel" 2>/dev/null || cp -p "$sib/$rel" "$entry/$rel" 2>/dev/null || true
-    done < "$list"
+    have=$( (cd "$entry" && tr '\n' '\0' < "$list" | xargs -0 ls -d -- 2>/dev/null | grep -c .) || true )
+    if [ "${have:-0}" -ne "$n" ]; then
+      while IFS= read -r rel; do
+        [ -n "$rel" ] && [ ! -f "$entry/$rel" ] || continue
+        ln "$sib/$rel" "$entry/$rel" 2>/dev/null || cp -p "$sib/$rel" "$entry/$rel" 2>/dev/null || true
+      done < "$list"
+    fi
   else
     # published entry, possible concurrent readers: atomic per-file swap
     while IFS= read -r rel; do
