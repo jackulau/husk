@@ -181,6 +181,29 @@ assert "setup --write created AGENTS.md with snippet" bash -c "grep -q 'husk:age
 assert "setup --write is idempotent (one snippet)" bash -c "[ \"\$(grep -c 'husk add' '$TMP/repo/AGENTS.md')\" -eq 1 ]"
 assert "setup without --write prints snippet" bash -c "'$HUSK' setup | grep -q 'husk add'"
 
+# ================= 13. store dedupe across entries =================
+make_repo "$TMP/dd" "dd-lock-v1"
+cd "$TMP/dd"
+"$HUSK" link >/dev/null 2>&1
+k1=$(cd "$TMP/dd" && "$HUSK" status | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+# bump the lockfile; blob.bin unchanged, left-pad content differs (embeds lock string)
+printf '%s\n' "dd-lock-v2" > package-lock.json
+echo "module.exports=2 // dd-lock-v2" > node_modules/left-pad/index.js
+k2=$("$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+dd_store=$(dirname "$(find "$HUSK_STORE" -type d -name "$k1" -print -quit)")
+assert "second lockfile made a second entry" test -d "$dd_store/$k2"
+same_inode() { [ "$(stat -f %i "$1" 2>/dev/null || stat -c %i "$1")" = "$(stat -f %i "$2" 2>/dev/null || stat -c %i "$2")" ]; }
+assert "identical file hardlinked across entries" same_inode "$dd_store/$k1/blob.bin" "$dd_store/$k2/blob.bin"
+assert_not "differing file NOT hardlinked" same_inode "$dd_store/$k1/left-pad/index.js" "$dd_store/$k2/left-pad/index.js"
+assert "new entry content is the new version" grep -q "dd-lock-v2" "$dd_store/$k2/left-pad/index.js"
+assert "old entry content untouched" grep -q "dd-lock-v1" "$dd_store/$k1/left-pad/index.js"
+# manual pass over pre-existing entries: undo one link, re-dedupe
+chmod u+w "$dd_store/$k2" 2>/dev/null; rm -f "$dd_store/$k2/blob.bin"
+dd if=/dev/zero of="$dd_store/$k2/blob.bin" bs=1024 count=64 2>/dev/null
+assert_not "fresh copy is a distinct inode" same_inode "$dd_store/$k1/blob.bin" "$dd_store/$k2/blob.bin"
+(cd "$TMP/dd" && "$HUSK" dedupe >/dev/null 2>&1)
+assert "husk dedupe re-links identical files" same_inode "$dd_store/$k1/blob.bin" "$dd_store/$k2/blob.bin"
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

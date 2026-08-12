@@ -71,6 +71,12 @@ supports (the **strategy ladder**):
 correctness. Real paths, private writes, zero tooling caveats — cross-agent
 interference is structurally impossible.
 
+Store entries themselves are **deduplicated across lockfile versions**: when a
+branch bumps one dependency, the new store entry hardlinks every byte-identical
+file to its nearest sibling entry (hash + perms matched, batched — no per-file
+forks). Measured on a 395 MB `node_modules` with one bumped package: the second
+entry costs ~20 MB, not 395 MB. Off switch: `HUSK_DEDUPE=0`.
+
 ## Commands
 
 ```
@@ -85,6 +91,7 @@ husk status                  link states, lockfile drift, store size
 husk doctor [--fix]          detect/repair dangling links, drift, stale locks
 husk reap [--dry-run]        delete stale worktrees (clean + merged/gone + idle 7d)
 husk gc [--dry-run]          drop store entries no worktree references
+husk dedupe                  hardlink identical files across store entries
 ```
 
 Machine-readable: stdout is stable `key=value` lines, prose goes to stderr.
@@ -144,6 +151,7 @@ HUSK_STORE=~/.husk/store      # store location
 HUSK_MODE=auto                # auto | clone | hardlink | symlink | copy
 HUSK_DIRS="node_modules"      # override auto-detection
 HUSK_REAP_DAYS=7              # reap idle threshold
+HUSK_DEDUPE=1                 # hardlink identical files across store entries at seed time
 ```
 
 ## What husk is not

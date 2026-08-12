@@ -33,6 +33,19 @@ mtime_of() { # file -> epoch seconds
   else stat -c %Y "$1"; fi
 }
 
+batch_hash() { # stdin: NUL-separated paths -> "HASH  path" lines
+  if command -v shasum >/dev/null 2>&1; then xargs -0 shasum -a 256 2>/dev/null
+  else xargs -0 sha256sum 2>/dev/null; fi
+}
+
+batch_perms() { # tree -> "PERMS path" lines (batched stat, few forks)
+  if stat -f %Lp "$1" >/dev/null 2>&1; then
+    find "$1" -type f -exec stat -f '%Lp %N' {} + 2>/dev/null
+  else
+    find "$1" -type f -exec stat -c '%a %n' {} + 2>/dev/null
+  fi
+}
+
 abspath() { (cd "$1" 2>/dev/null && pwd -P); }
 
 # ---------- repo context ----------
@@ -203,9 +216,91 @@ del_ref() { # entry worktree-root
   mv "$tmp" "$refs"
 }
 
+# ---------- store dedupe ----------
+# Entries for the same dir under different lockfile keys are mostly identical
+# (one dep bump changes a handful of packages). Hardlink byte-identical files
+# across entries so the store pays only for what actually changed. Safe because
+# store entries are immutable after seeding: provisioning clones/copies OUT of
+# them, and symlink mode write-guards the entry root.
+nearest_sibling() { # entry -> newest sibling entry for the same dir, or empty
+  local entry="$1" parent d best="" bm=0 m
+  parent=$(dirname "$entry")
+  for d in "$parent"/*; do
+    [ -d "$d" ] || continue
+    [ "$d" = "$entry" ] && continue
+    case "$d" in *.tmp.*|*.lock) continue ;; esac
+    m=$(mtime_of "$d" 2>/dev/null || echo 0)
+    if [ "$m" -gt "$bm" ]; then bm=$m; best=$d; fi
+  done
+  printf '%s' "$best"
+}
+
+tree_sig() { # tree -> sorted "hash<TAB>perms<TAB>relpath" lines (two batched passes, O(1) forks)
+  local tree="$1" th tp
+  th=$(mktemp "${TMPDIR:-/tmp}/husk-sig.XXXXXX") || return 1
+  tp=$(mktemp "${TMPDIR:-/tmp}/husk-sig.XXXXXX") || { rm -f "$th"; return 1; }
+  ( cd "$tree" && find . -type f ! -name .husk-seeded ! -name .husk-manifest -print0 | batch_hash ) \
+    | awk '{h=$1; sub(/^[^ ]+ [ *]?/,""); print $0 "\t" h}' > "$th"
+  ( cd "$tree" && batch_perms . ) \
+    | awk '{p=$1; sub(/^[^ ]+ /,""); print $0 "\t" p}' > "$tp"
+  awk -F'\t' 'NR==FNR{p[$1]=$2;next} ($1 in p){print $2 "\t" p[$1] "\t" $1}' "$tp" "$th" | LC_ALL=C sort
+  rm -f "$th" "$tp"
+}
+
+sig_file_for() { # tree -> path to a signature file, caching as .husk-manifest when writable
+  local tree="$1" mf="$1/.husk-manifest" tmp t
+  [ -f "$mf" ] && { printf '%s' "$mf"; return 0; }
+  tmp="$mf.tmp.$$"
+  if tree_sig "$tree" > "$tmp" 2>/dev/null && mv "$tmp" "$mf" 2>/dev/null; then
+    printf '%s' "$mf"; return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  t=$(mktemp "${TMPDIR:-/tmp}/husk-sig.XXXXXX") || return 1
+  tree_sig "$tree" > "$t" && printf '%s' "$t"
+}
+
+batch_link() { # listfile srcdir dstdir -> hardlink listed "./rel" paths in bulk
+  if command -v cpio >/dev/null 2>&1; then
+    ( cd "$2" && cpio -pdl "$3" < "$1" ) 2>/dev/null && return 0
+  fi
+  ( cd "$2" && pax -rwl "$3" < "$1" ) 2>/dev/null
+}
+
+dedupe_entry() { # entry sibling [live] -> hardlink files with identical hash+perms+relpath
+  local entry="$1" sib="$2" live="${3:-0}" esig ssig list n=0 rel f s
+  esig=$(sig_file_for "$entry") || return 0
+  ssig=$(sig_file_for "$sib")   || return 0
+  list=$(mktemp "${TMPDIR:-/tmp}/husk-dd.XXXXXX") || return 0
+  LC_ALL=C comm -12 "$esig" "$ssig" 2>/dev/null | cut -f3 > "$list"
+  n=$(grep -c . "$list" || true)
+  if [ "$n" -eq 0 ]; then rm -f "$list"; return 0; fi
+  if [ "$live" = "0" ]; then
+    # unpublished tmp entry, no readers: bulk remove + bulk hardlink (O(1) forks),
+    # then heal any miss from the sibling (same content by definition)
+    ( cd "$entry" && tr '\n' '\0' < "$list" | xargs -0 rm -f -- ) 2>/dev/null
+    batch_link "$list" "$sib" "$entry" || true
+    while IFS= read -r rel; do
+      [ -n "$rel" ] && [ ! -f "$entry/$rel" ] || continue
+      ln "$sib/$rel" "$entry/$rel" 2>/dev/null || cp -p "$sib/$rel" "$entry/$rel" 2>/dev/null || true
+    done < "$list"
+  else
+    # published entry, possible concurrent readers: atomic per-file swap
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      f="$entry/$rel"; s="$sib/$rel"
+      [ -f "$f" ] && [ ! -L "$f" ] && [ -f "$s" ] && [ ! -L "$s" ] || continue
+      ln "$s" "$f.husk-dd.$$" 2>/dev/null || continue
+      mv -f "$f.husk-dd.$$" "$f" 2>/dev/null || rm -f "$f.husk-dd.$$"
+    done < "$list"
+  fi
+  rm -f "$list"
+  note "dedupe: $n files hardlinked to sibling entry"
+  return 0
+}
+
 # ---------- seeding ----------
 seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if exists)
-  local src="$1" entry="$2" parent lock tmp
+  local src="$1" entry="$2" parent lock tmp sib
   [ -d "$entry" ] && return 0
   parent=$(dirname "$entry"); mkdir -p "$parent"
   lock="$entry.lock"
@@ -214,6 +309,11 @@ seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if
   tmp="$entry.tmp.$$"
   rm -rf "$tmp"
   if cow_clone "$src" "$tmp"; then :; else plain_copy "$src" "$tmp"; fi
+  if [ "${HUSK_DEDUPE:-1}" = "1" ]; then
+    sib=$(nearest_sibling "$entry")
+    [ -n "$sib" ] && dedupe_entry "$tmp" "$sib"
+  fi
+  sig_file_for "$tmp" >/dev/null 2>&1 || true   # cache manifest for future siblings
   date +%s > "$tmp/.husk-seeded" 2>/dev/null || true
   mv "$tmp" "$entry"
   release_lock "$lock"
@@ -626,6 +726,30 @@ cmd_gc() {
   return 0
 }
 
+# ---------- dedupe (share identical files across existing store entries) ----------
+cmd_dedupe() {
+  local base dirp entry prev
+  base=$(store_base)
+  [ -d "$base" ] || { out "dedupe entries=0"; return 0; }
+  for dirp in "$base"/*; do
+    [ -d "$dirp" ] || continue
+    prev=""
+    # oldest -> newest so later entries link back to earlier inodes
+    while IFS= read -r entry; do
+      [ -n "$entry" ] && [ -d "$entry" ] || continue
+      case "$entry" in *.tmp.*|*.lock) continue ;; esac
+      if [ -n "$prev" ]; then
+        note "dedupe: $(basename "$dirp")/$(basename "$entry") vs $(basename "$prev")"
+        dedupe_entry "$entry" "$prev" 1
+      fi
+      prev="$entry"
+    done <<EOF
+$(find "$dirp" -mindepth 1 -maxdepth 1 -type d -exec sh -c 'if stat -f "%m %N" "$1" >/dev/null 2>&1; then stat -f "%m %N" "$1"; else stat -c "%Y %n" "$1"; fi' _ {} \; 2>/dev/null | sort -n | cut -d' ' -f2-)
+EOF
+  done
+  out "dedupe done=1"
+}
+
 # ---------- setup (agent adoption: adopt + instructions) ----------
 agent_snippet() {
   cat <<'EOF'
@@ -675,6 +799,7 @@ USAGE
   husk doctor [--fix]                               find/repair dangling links, drift, stale locks
   husk reap [--dry-run] [--days N]                  delete stale worktrees (clean+merged+idle)
   husk gc [--dry-run]                               drop unreferenced store entries
+  husk dedupe                                       hardlink identical files across store entries
 
 MODES (--mode or HUSK_MODE; default: auto)
   auto      probe filesystem: clone > hardlink > symlink
@@ -687,6 +812,7 @@ ENV
   HUSK_STORE      store location (default ~/.husk/store)
   HUSK_MODE       default mode (default auto)
   HUSK_REAP_DAYS  reap idle threshold (default 7)
+  HUSK_DEDUPE     hardlink identical files across store entries at seed time (default 1)
 
 Config file: .husk.conf at repo root (shell syntax: HUSK_DIRS="node_modules .venv" etc.)
 Output: stdout is stable key=value lines; humans read stderr.
@@ -708,6 +834,7 @@ main() {
     doctor)  cmd_doctor "$@" ;;
     reap)    cmd_reap "$@" ;;
     gc)      cmd_gc "$@" ;;
+    dedupe)  cmd_dedupe "$@" ;;
     version|--version) out "husk $HUSK_VERSION" ;;
     ""|help|--help|-h) usage ;;
     *) die "unknown command: $cmd (try 'husk --help')" ;;
