@@ -48,14 +48,18 @@ batch_perms() { # tree -> "PERMS path" lines (batched stat, few forks)
   fi
 }
 
-abspath() { (cd "$1" 2>/dev/null && pwd -P); }
+abspath() { (cd "$1" 2>/dev/null && posix_path "$(pwd -P)"); }
 
-posix_path() { # git.exe on Windows emits C:/-style paths; hashing or comparing
-  # them against the shell's POSIX view silently splits the store namespace
+posix_path() { # git.exe on Windows emits C:/-style paths, and MSYS mounts spell
+  # one dir two ways (/tmp vs /c/Users/.../Temp); hashing or comparing mixed
+  # spellings silently splits the store namespace. Canonical form is cygpath -u
+  # of the Windows form, so every absolute path collapses to one spelling.
+  command -v cygpath >/dev/null 2>&1 || { printf '%s' "$1"; return 0; }
   case "$1" in
-    [A-Za-z]:*) if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; return 0; fi ;;
+    [A-Za-z]:*) cygpath -u "$1" ;;
+    /*)         cygpath -u "$(cygpath -m "$1")" ;;
+    *)          printf '%s' "$1" ;;
   esac
-  printf '%s' "$1"
 }
 
 posix_path_stream() { # stdin: one path per line -> POSIX view (no-op off Windows)

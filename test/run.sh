@@ -441,6 +441,20 @@ kA=$(cd "$TMP/un" && PATH="$TMP/us1:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's
 kB=$(cd "$TMP/un" && PATH="$TMP/us2:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
 assert "store key stable across Windows build numbers" test -n "$kA" -a "$kA" = "$kB"
 
+# repo_id must not depend on which MSYS mount spelling the cwd used: /tmp and
+# /c/Users/.../Temp are the same dir on native Git Bash, and mixed spellings
+# split the store namespace (adopt seeded one id, add provisioned another)
+if command -v cygpath >/dev/null 2>&1; then
+  make_repo "$TMP/alias" "alias-lock-v1"
+  wform=$(cygpath -m "$TMP/alias")
+  altform="/$(printf '%s' "$wform" | cut -c1 | tr 'A-Z' 'a-z')$(printf '%s' "$wform" | cut -c3-)"
+  sA=$(cd "$TMP/alias" && HUSK_STORE="$TMP/aliasstore" "$HUSK" status 2>/dev/null | grep '^store=')
+  sB=$(cd "$altform" && HUSK_STORE="$TMP/aliasstore" "$HUSK" status 2>/dev/null | grep '^store=')
+  assert "store namespace stable across MSYS mount aliases" test -n "$sA" -a "$sA" = "$sB"
+else
+  ok "skip: no cygpath here (mount-alias spellings are a Windows thing)"
+fi
+
 # ================= 17. stress: hostile names + big tree (opt-in: HUSK_STRESS=1) =================
 if [ "${HUSK_STRESS:-0}" = "1" ]; then
   mkdir -p "$TMP/stress"; ( cd "$TMP/stress" && git init -q -b main \
