@@ -1,5 +1,7 @@
 # husk
 
+[![CI](https://github.com/jackulau/husk/actions/workflows/ci.yml/badge.svg)](https://github.com/jackulau/husk/actions/workflows/ci.yml)
+
 **Storage-efficient git worktrees.** Share heavy dependency dirs (`node_modules`,
 `.venv`, `target/`, `vendor/`, `Pods/`) across all your worktrees instead of paying
 for a full copy in each one, without giving up correctness.
@@ -240,6 +242,9 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck bin/husk install.sh      # must stay clean (info-level notes are OK)
 ```
+
+CI runs the suite on every push: Ubuntu 24.04 and macOS with stress on, Windows
+native Git Bash, plus shellcheck (`.github/workflows/ci.yml`).
 
 Before claiming Linux works, run the suite as a **non-root** user on a real
 distro. Root bypasses permission checks and hides an entire class of bugs:

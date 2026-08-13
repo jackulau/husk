@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04      # ext4: hardlink mode; runner is non-root
+            stress: "1"
+          - os: macos-latest      # APFS: clone mode (the primary target)
+            stress: "1"
+          - os: windows-latest    # native Git Bash: NTFS hardlink mode
+            stress: "0"           # stress tree is slow on NTFS + Defender
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash               # on windows this is Git Bash, the supported native path
+    steps:
+      - uses: actions/checkout@v4
+      - name: test suite
+        run: ./test/run.sh
+        env:
+          HUSK_STRESS: ${{ matrix.stress }}
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # contract from README: must stay clean, info-level notes are OK
+      - name: shellcheck
+        run: shellcheck --severity=warning bin/husk install.sh test/run.sh
