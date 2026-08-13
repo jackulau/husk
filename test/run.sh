@@ -38,7 +38,7 @@ chmod u+w "$TMP/.gdprobe" 2>/dev/null; rm -rf "$TMP/.gdprobe"
 # ---------- fixture: a fake node repo ----------
 make_repo() { # path lock-content
   local r="$1" lock="$2"
-  mkdir -p "$r"; cd "$r"
+  mkdir -p "$r"; cd "$r" || exit 1
   git init -q -b main
   echo node_modules > .gitignore   # real repos never commit deps; worktrees must be PROVISIONED
   echo '{"name":"fx"}' > package.json
@@ -52,7 +52,7 @@ make_repo() { # path lock-content
 
 # ================= 1. link seeds store, keys by lockfile =================
 make_repo "$TMP/repo" "lock-v1"
-cd "$TMP/repo"
+cd "$TMP/repo" || exit 1
 outp=$("$HUSK" link 2>/dev/null)
 assert "link exits 0 on fresh repo" test $? -eq 0
 key=$(printf '%s' "$outp" | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
@@ -82,7 +82,7 @@ else
 fi
 
 # ================= 4. lockfile divergence -> different store entry =================
-cd "$TMP/wt1"
+cd "$TMP/wt1" || exit 1
 printf 'lock-v2\n' > package-lock.json
 "$HUSK" link --mode copy >/dev/null 2>&1; rc=$?
 # store miss expected (no donor with lock-v2): exit 2
@@ -98,7 +98,7 @@ assert "both store entries coexist" test "$(find "$HUSK_STORE" -mindepth 3 -maxd
 
 # ================= 5. symlink mode + write guard =================
 make_repo "$TMP/repo2" "slock-v1"
-cd "$TMP/repo2"
+cd "$TMP/repo2" || exit 1
 if [ "$HAVE_SYMLINK" = 1 ]; then
   "$HUSK" link --mode symlink >/dev/null 2>&1
   assert "symlink mode: node_modules is a symlink" test -L "$TMP/repo2/node_modules"
@@ -124,7 +124,7 @@ if [ "$HAVE_SYMLINK" = 1 ]; then
   assert "doctor detects dangling link" bash -c "cd '$TMP/repo2' && '$HUSK' doctor | grep -q dangling"
   mv "$entry2.hidden" "$entry2"
   rm "$TMP/repo2/node_modules"; ln -s "$TMP/nowhere" "$TMP/repo2/node_modules"
-  cd "$TMP/repo2"; "$HUSK" doctor --fix >/dev/null 2>&1 || true
+  cd "$TMP/repo2" || exit 1; "$HUSK" doctor --fix >/dev/null 2>&1 || true
   assert "doctor --fix repaired the link" test -e "$TMP/repo2/node_modules/left-pad/index.js"
   assert "doctor --fix preserved symlink mode" test -L "$TMP/repo2/node_modules"
 else
@@ -134,7 +134,7 @@ else
 fi
 
 # ================= 7. unlink materializes a private copy =================
-cd "$TMP/repo2"
+cd "$TMP/repo2" || exit 1
 "$HUSK" unlink node_modules >/dev/null 2>&1
 assert "unlink: no longer a symlink" bash -c "[ ! -L '$TMP/repo2/node_modules' ]"
 assert "unlink: files present and private" test -f "$TMP/repo2/node_modules/left-pad/index.js"
@@ -149,7 +149,7 @@ assert "reseed after unlink+edit stores the edited content" bash -c "grep -q 'ed
 
 # ================= 8. concurrent link race (one seeds, all succeed) =================
 make_repo "$TMP/repo3" "rlock-v1"
-cd "$TMP/repo3"
+cd "$TMP/repo3" || exit 1
 pids=""
 for i in 1 2 3 4 5; do
   ( "$HUSK" link >/dev/null 2>&1 ) & pids="$pids $!"
@@ -163,7 +163,7 @@ assert "race produced exactly one store entry" test "$n3" -eq 1
 assert "no leftover locks/tmp after race" bash -c "! find '$HUSK_STORE' \( -name '*.lock' -o -name '*.tmp.*' \) | grep -q ."
 
 # ================= 9. reap: only clean+merged+idle worktrees =================
-cd "$TMP/repo"
+cd "$TMP/repo" || exit 1
 OLD=$(date -v-9d '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || date -d '9 days ago' '+%Y-%m-%dT%H:%M:%S')
 STAMP=$(date -v-8d +%Y%m%d%H%M 2>/dev/null || date -d '8 days ago' +%Y%m%d%H%M)
 git worktree add -q "$TMP/wt-merged" -b merged-branch
@@ -192,7 +192,7 @@ assert "reap kept dirty worktree" test -d "$TMP/wt-dirty"
 assert "reap kept unmerged worktree" test -d "$TMP/wt-unmerged"
 
 # ================= 10. gc drops unreferenced entries, keeps referenced =================
-cd "$TMP/repo"
+cd "$TMP/repo" || exit 1
 # fabricate an orphan entry referenced only by a worktree that no longer exists
 # (in THIS repo's store namespace - derive it from wt1's live key)
 live_key=$(cd "$TMP/wt1" && "$HUSK" status | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
@@ -220,7 +220,7 @@ assert "install.sh installed an executable" test -x "$BIN_DIR/husk"
 assert "installed husk self-reports version" bash -c "'$BIN_DIR/husk' version | grep -q husk"
 
 # ================= 12. setup --write (agent adoption) =================
-cd "$TMP/repo"
+cd "$TMP/repo" || exit 1
 "$HUSK" setup --write >/dev/null 2>&1
 assert "setup --write created AGENTS.md with snippet" bash -c "grep -q 'husk:agent-instructions' '$TMP/repo/AGENTS.md'"
 "$HUSK" setup --write >/dev/null 2>&1
@@ -229,7 +229,7 @@ assert "setup without --write prints snippet" bash -c "'$HUSK' setup | grep -q '
 
 # ================= 13. store dedupe across entries =================
 make_repo "$TMP/dd" "dd-lock-v1"
-cd "$TMP/dd"
+cd "$TMP/dd" || exit 1
 "$HUSK" link >/dev/null 2>&1
 k1=$(cd "$TMP/dd" && "$HUSK" status | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
 # bump the lockfile; blob.bin unchanged, left-pad content differs (embeds lock string)
@@ -257,7 +257,7 @@ assert "husk dedupe re-links identical files" same_inode "$dd_store/$k1/blob.bin
 # unlink's contract is "stop sharing", so it must rebuild with private inodes
 # or a post-unlink in-place edit would poison every sibling worktree
 make_repo "$TMP/hl" "hl-lock-v1"
-cd "$TMP/hl"
+cd "$TMP/hl" || exit 1
 "$HUSK" link --mode hardlink >/dev/null 2>&1
 "$HUSK" add "$TMP/hl-wt" hl-b --mode hardlink >/dev/null 2>&1
 hl_key=$(cd "$TMP/hl-wt" && "$HUSK" status | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
@@ -307,7 +307,7 @@ res_store=$(dirname "$(find "$HUSK_STORE" -type d -name "$key" -print -quit)")
 mkdir -p "$res_store/deadentry.tmp.99999999"
 mkdir -p "$TMP/repo/node_modules.husk-tmp.99999999"
 mkdir -p "$res_store/liveentry.tmp.$$"
-cd "$TMP/repo"
+cd "$TMP/repo" || exit 1
 assert "doctor flags store tmp residue" bash -c "'$HUSK' doctor | grep -q 'tmp-residue.*deadentry'"
 assert "doctor flags worktree tmp residue" bash -c "'$HUSK' doctor | grep -q 'tmp-residue.*node_modules.husk-tmp'"
 "$HUSK" doctor --fix >/dev/null 2>&1
@@ -344,7 +344,7 @@ assert "slow stampede still ran exactly one installer" test "$(wc -l < "$NPM_LOG
 
 # pid-less stale lock (holder died between mkdir and pid write) gets stolen once old
 make_repo "$TMP/pl" "pl-lock-v1"
-cd "$TMP/pl"
+cd "$TMP/pl" || exit 1
 pl_out=$("$HUSK" link 2>/dev/null)
 pl_key=$(printf '%s' "$pl_out" | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
 pl_entry=$(find "$HUSK_STORE" -type d -name "$pl_key" -print -quit)
@@ -368,7 +368,7 @@ assert "gc removed the aged entry and its stamp" bash -c "[ ! -d '$pl_store/cafe
 # ================= 16. conf safety, gc authority, exit codes, edge paths =================
 # .husk.conf is parsed, never sourced: injection attempts must not execute
 make_repo "$TMP/cf" "cf-lock-v1"
-cd "$TMP/cf"
+cd "$TMP/cf" || exit 1
 cat > .husk.conf <<CONF
 # comment line
 HUSK_MODE=copy
@@ -401,7 +401,7 @@ assert "worktree still created on store miss" test -d "$TMP/x2-wt"
 
 # doctor sweeps .husk-old replace residue
 mkdir -p "$TMP/repo/node_modules.husk-old.99999999"
-cd "$TMP/repo"
+cd "$TMP/repo" || exit 1
 assert "doctor flags .husk-old residue" bash -c "'$HUSK' doctor | grep -q 'node_modules.husk-old'"
 "$HUSK" doctor --fix >/dev/null 2>&1
 assert "doctor --fix removed .husk-old residue" bash -c "[ ! -d '$TMP/repo/node_modules.husk-old.99999999' ]"
@@ -446,9 +446,9 @@ if [ "${HUSK_STRESS:-0}" = "1" ]; then
   mkdir -p "$TMP/stress"; ( cd "$TMP/stress" && git init -q -b main \
     && echo '{"name":"stress"}' > package.json && printf 'stress-lock\n' > package-lock.json \
     && git add -A && git commit -qm i )
-  cd "$TMP/stress"
+  cd "$TMP/stress" || exit 1
   mkdir -p node_modules
-  ( cd node_modules
+  ( cd node_modules || exit 1
     d=deep; for i in $(seq 1 45); do d="$d/n$i"; done; mkdir -p "$d"; echo x > "$d/leaf.js"
     mkdir -p "-dashdir" "empty-dir" "uni-\xc3\xa9\xc3\xb6" 2>/dev/null || mkdir -p "unidir"
     echo x > "./-dashfile"; : > zero-byte; dd if=/dev/zero of=big.bin bs=1048576 count=8 2>/dev/null
