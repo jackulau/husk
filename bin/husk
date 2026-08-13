@@ -261,11 +261,19 @@ release_lock() { rm -rf "$1"; HUSK_CLEAN_LOCK=""; }
 # trap sweeps whatever is still marked. rm_rf_safe is defined just below.
 HUSK_CLEAN_LOCK=""
 HUSK_CLEAN_TMP=""
+HUSK_PREFARM_TMP=""
+HUSK_PREFARM_PID=""
 PROBE_CACHE_KEY=""
 PROBE_CACHE_VAL=""
 husk_cleanup() {
   [ -n "$HUSK_CLEAN_TMP" ] && rm_rf_safe "$HUSK_CLEAN_TMP" 2>/dev/null
   [ -n "$HUSK_CLEAN_LOCK" ] && rm -rf "$HUSK_CLEAN_LOCK" 2>/dev/null
+  if [ -n "$HUSK_PREFARM_TMP" ]; then
+    [ -n "$HUSK_PREFARM_PID" ] && kill "$HUSK_PREFARM_PID" 2>/dev/null
+    wait 2>/dev/null || true
+    rm_rf_safe "$HUSK_PREFARM_TMP" 2>/dev/null
+    rm -f "$HUSK_PREFARM_TMP.done" "$HUSK_PREFARM_TMP.failed" 2>/dev/null
+  fi
   return 0
 }
 trap husk_cleanup EXIT
@@ -572,6 +580,23 @@ swap_in() { # tmp target -> make tmp live at target, then discard the old tree.
   return 0
 }
 
+consume_prefarm() { # target entry mode -> 0 if the staged speculative tree was swapped in
+  [ -n "${HUSK_PREFARM_TMP:-}" ] || return 1
+  [ "$2" = "${HUSK_PREFARM_ENTRY:-}" ] || return 1
+  [ "$3" = "${HUSK_PREFARM_MODE:-}" ] || return 1
+  # the farm runs in cmd_add's shell, not ours: rendezvous on marker files
+  local n=0
+  while [ ! -e "$HUSK_PREFARM_TMP.done" ] && [ ! -e "$HUSK_PREFARM_TMP.failed" ]; do
+    [ "$n" -ge 3000 ] && return 1
+    sleep 0.1; n=$((n + 1))
+  done
+  [ -e "$HUSK_PREFARM_TMP.done" ] && [ -d "$HUSK_PREFARM_TMP" ] || return 1
+  strip_meta "$HUSK_PREFARM_TMP"
+  swap_in "$HUSK_PREFARM_TMP" "$1" || return 1
+  chmod u+w "$1" 2>/dev/null || true
+  return 0
+}
+
 provision() { # entry target mode
   local entry="$1" target="$2" mode="$3" tmp
   # in-use stamp: a brand-new worktree's ref+state are written only AFTER
@@ -581,6 +606,7 @@ provision() { # entry target mode
   date +%s > "$entry.used" 2>/dev/null || true
   case "$mode" in
     clone)
+      consume_prefarm "$target" "$entry" "$mode" && return 0
       tmp="$target.husk-tmp.$$"
       HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
@@ -590,6 +616,7 @@ provision() { # entry target mode
       HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;   # private copy: undo inherited write guard
     hardlink)
+      consume_prefarm "$target" "$entry" "$mode" && return 0
       tmp="$target.husk-tmp.$$"
       HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
@@ -774,6 +801,45 @@ cmd_add() {
   [ -n "$path" ] || die "usage: husk add <path> [branch]"
   repo_root >/dev/null
 
+  # speculative provision: farm the store entry for the CURRENT lockfile into
+  # a staging dir WHILE git populates the worktree, so wall time approaches
+  # max(checkout, farm) instead of checkout + farm. A new branch almost always
+  # shares HEAD's lockfile, so the staged tree is almost always used; link_one
+  # re-derives the key from the REAL checkout and consume_prefarm only accepts
+  # the stage on an exact entry+mode match. Any mismatch (diverged lockfile,
+  # different mode, farm failure) falls through to the normal sequential path.
+  # Worst case is wasted work in the staging dir, never a wrong link.
+  # HUSK_PREFARM=0 disables.
+  local sroot sdir skey sentry smode sparent
+  if [ "${HUSK_PREFARM:-1}" != "0" ]; then
+    sroot=$(repo_root); load_conf "$sroot"
+    sparent=$(dirname "$path")
+    if [ -d "$sparent" ]; then
+      for sdir in $(detect_dirs "$sroot"); do
+        skey=$(key_for "$sroot" "$sdir") || skey=""
+        [ -n "$skey" ] || continue
+        sentry=$(entry_path "$sdir" "$skey")
+        [ -d "$sentry" ] || continue
+        smode=$(probe_mode "$(store_base)" "$sparent")
+        case "$smode" in clone|hardlink) ;; *) continue ;; esac
+        HUSK_PREFARM_TMP="$sparent/$(basename "$path").husk-pre.$$"
+        rm_rf_safe "$HUSK_PREFARM_TMP"
+        date +%s > "$sentry.used" 2>/dev/null || true
+        if [ "$smode" = "clone" ]; then
+          ( cow_clone "$sentry" "$HUSK_PREFARM_TMP" \
+              && : > "$HUSK_PREFARM_TMP.done" || : > "$HUSK_PREFARM_TMP.failed" ) &
+        else
+          ( hardlink_farm "$sentry" "$HUSK_PREFARM_TMP" \
+              && : > "$HUSK_PREFARM_TMP.done" || : > "$HUSK_PREFARM_TMP.failed" ) &
+        fi
+        HUSK_PREFARM_PID=$!
+        HUSK_PREFARM_ENTRY="$sentry"
+        HUSK_PREFARM_MODE="$smode"
+        break   # one dir is the common case; the rest link sequentially
+      done
+    fi
+  fi
+
   if [ -n "$branch" ]; then
     if git show-ref --verify --quiet "refs/heads/$branch"; then
       # shellcheck disable=SC2086
@@ -792,6 +858,13 @@ cmd_add() {
   local link_rc=0
   # shellcheck disable=SC2086
   ( cd "$path" && cmd_link $install_flag ) || link_rc=$?
+  # discard an unused stage (consume_prefarm mv'd it away if it was used)
+  if [ -n "$HUSK_PREFARM_TMP" ]; then
+    wait 2>/dev/null || true
+    [ -e "$HUSK_PREFARM_TMP" ] && rm_rf_safe "$HUSK_PREFARM_TMP"
+    rm -f "$HUSK_PREFARM_TMP.done" "$HUSK_PREFARM_TMP.failed" 2>/dev/null || true
+    HUSK_PREFARM_TMP="" HUSK_PREFARM_PID=""
+  fi
   out "worktree path=$(abspath "$path")"
 
   # opportunistic reap nudge (no daemon; fleet stays bounded). The probe walks
@@ -947,7 +1020,8 @@ cmd_doctor() {
   # replace (worktree), or live-dedupe swap (store, .husk-dd files).
   # The pid is baked into the name; skip residue whose owner is still running.
   local tmpd
-  for tmpd in "$(store_base)"/*/*.tmp.* "$root"/*.husk-tmp.* "$root"/*.husk-old.*; do
+  for tmpd in "$(store_base)"/*/*.tmp.* "$root"/*.husk-tmp.* "$root"/*.husk-old.* \
+              "$root"/../*.husk-pre.*; do
     [ -e "$tmpd" ] || [ -L "$tmpd" ] || continue
     pid=${tmpd##*.}
     case "$pid" in *[!0-9]*|'') pid="" ;; esac

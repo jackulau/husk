@@ -475,6 +475,28 @@ if [ "${HUSK_STRESS:-0}" = "1" ]; then
   assert "stress: deep leaf survived" bash -c "find \"\$(find '$HUSK_STORE' -type d -name 'n45' | head -1)\" -name leaf.js | grep -q leaf"
 fi
 
+# ================= 18. speculative prefarm (add overlaps checkout) =================
+make_repo "$TMP/pre" "lock-pre"
+cd "$TMP/pre" || exit 1
+"$HUSK" link >/dev/null 2>&1
+"$HUSK" add "$TMP/pre-wt" feat-pre >/dev/null 2>&1
+assert "prefarm: add provisions deps from the stage" test -e "$TMP/pre-wt/node_modules/left-pad/index.js"
+assert_not "prefarm: no staging residue after add" bash -c "ls -d '$TMP'/pre-wt.husk-pre.* 2>/dev/null | grep -q ."
+# a branch whose lockfile diverged from HEAD must never be served the stale
+# stage: link_one re-keys from the real checkout and the stage is discarded
+cd "$TMP/pre" || exit 1
+git checkout -qb feat-newlock
+printf '%s\n' "lock-pre-CHANGED" > package-lock.json
+git add package-lock.json && git commit -qm newlock
+git checkout -q main
+rc_pre=0; "$HUSK" add "$TMP/pre-wt2" feat-newlock >/dev/null 2>&1 || rc_pre=$?
+assert "prefarm discard: diverged lockfile is a store miss (exit 2)" test "$rc_pre" -eq 2
+assert_not "prefarm discard: stale deps NOT provisioned" test -e "$TMP/pre-wt2/node_modules/left-pad/index.js"
+assert_not "prefarm discard: no staging residue" bash -c "ls -d '$TMP'/pre-wt2.husk-pre.* 2>/dev/null | grep -q ."
+assert "prefarm off: HUSK_PREFARM=0 still provisions" bash -c "
+  HUSK_PREFARM=0 '$HUSK' add '$TMP/pre-wt3' feat-off >/dev/null 2>&1 &&
+  test -e '$TMP/pre-wt3/node_modules/left-pad/index.js'"
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
