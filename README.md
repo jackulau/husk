@@ -9,7 +9,7 @@ bytes. With husk it's a few GB. Built for agent-native workflows where 20-100
 concurrent worktrees is normal.
 
 One script, no dependencies. bash 3.2+ (stock macOS works), Linux (suite green on
-Ubuntu 24.04), Windows via WSL.
+Ubuntu 24.04), Windows via WSL or native Git Bash (suite green on both).
 
 ## Install
 
@@ -198,10 +198,21 @@ nothing else is.
 - **Linux**: fully supported, test suite runs green on Ubuntu 24.04. btrfs and XFS
   get `clone` (reflink), ext4 and overlayfs get `hardlink`. Needs git, perl, and
   openssl or sha256sum (all present on any dev box).
-- **Windows**: use WSL (that is the Linux path above). Native Git Bash is
-  best-effort: NTFS hardlinks work, so the probe lands on `hardlink` mode; the
-  probe also verifies symlinks are real before ever choosing them, because MSYS
-  fakes `ln -s` with a copy unless Developer Mode is on. Not CI-tested yet.
+- **Windows (WSL)**: the Linux path above; suite green on Ubuntu 24.04 under
+  WSL2.
+- **Windows (native Git Bash)**: supported, suite green (symlink-dependent
+  tests skip honestly). The probe lands on `hardlink` mode — NTFS hardlinks
+  are real. MSYS fakes `ln -s` with a copy unless Developer Mode is on, so
+  the probe never chooses symlink mode by itself, and even a forced
+  `--mode symlink` verifies the link and falls back to `copy` rather than
+  record sharing that isn't happening. Paths that native `git.exe` emits
+  (`C:/...`) are normalized before being hashed or compared, so the store
+  namespace is stable across the main checkout and its worktrees. Measured
+  on NTFS (333 MB, 9,800-file `node_modules`): `husk add` 5.7s vs 8.7s for
+  worktree+full-copy, ~2 MB of real disk per extra worktree, and a
+  one-package lockfile bump costs ~3 MB of store after dedupe, not 333 MB.
+  One-time `husk adopt` is ~17s; the very first run can be slower while
+  Windows Defender scans the freshly written files.
 
 husk never guesses the platform. Every mode is probed against the actual
 filesystems in play, and anything that fails a probe falls off the ladder.

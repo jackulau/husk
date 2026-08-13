@@ -1,0 +1,7 @@
+# Shell scripts must stay LF: a CRLF checkout breaks the shebang under WSL
+# ("env: bash\r: No such file or directory") and \r leaks into every parsed
+# string under Git Bash. Windows clones default to core.autocrlf=true, so
+# without this file the tool is broken on Windows out of the box.
+* text=auto
+bin/husk text eol=lf
+*.sh text eol=lf

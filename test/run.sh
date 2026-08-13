@@ -23,6 +23,18 @@ assert_not() {
 cleanup() { chmod -R u+w "$TMP" 2>/dev/null || true; rm -rf "$TMP"; }
 trap cleanup EXIT
 
+# ---------- capability probes ----------
+# MSYS/Git Bash fakes 'ln -s' with a copy unless symlink privilege is enabled,
+# so symlink-shaped assertions are meaningless there. Directory write guards
+# (chmod a-w) are ignored by root and by NTFS, so that gets its own probe.
+HAVE_SYMLINK=0
+ln -s "$TMP" "$TMP/.slprobe" 2>/dev/null && [ -L "$TMP/.slprobe" ] && HAVE_SYMLINK=1
+rm -rf "$TMP/.slprobe"
+CAN_DIRGUARD=0
+mkdir "$TMP/.gdprobe" && chmod a-w "$TMP/.gdprobe" 2>/dev/null
+touch "$TMP/.gdprobe/x" 2>/dev/null || CAN_DIRGUARD=1
+chmod u+w "$TMP/.gdprobe" 2>/dev/null; rm -rf "$TMP/.gdprobe"
+
 # ---------- fixture: a fake node repo ----------
 make_repo() { # path lock-content
   local r="$1" lock="$2"
@@ -87,20 +99,39 @@ assert "both store entries coexist" test "$(find "$HUSK_STORE" -mindepth 3 -maxd
 # ================= 5. symlink mode + write guard =================
 make_repo "$TMP/repo2" "slock-v1"
 cd "$TMP/repo2"
-"$HUSK" link --mode symlink >/dev/null 2>&1
-assert "symlink mode: node_modules is a symlink" test -L "$TMP/repo2/node_modules"
-assert "symlink resolves into store" bash -c "readlink '$TMP/repo2/node_modules' | grep -q '$HUSK_STORE'"
-assert "write guard: creating file at entry root fails" bash -c "! touch '$TMP/repo2/node_modules/newpkg' 2>/dev/null"
+if [ "$HAVE_SYMLINK" = 1 ]; then
+  "$HUSK" link --mode symlink >/dev/null 2>&1
+  assert "symlink mode: node_modules is a symlink" test -L "$TMP/repo2/node_modules"
+  assert "symlink resolves into store" bash -c "readlink '$TMP/repo2/node_modules' | grep -q '$HUSK_STORE'"
+  if [ "$CAN_DIRGUARD" = 1 ]; then
+    assert "write guard: creating file at entry root fails" bash -c "! touch '$TMP/repo2/node_modules/newpkg' 2>/dev/null"
+  else
+    ok "skip: dir write guard not enforceable here (root, or FS ignores dir a-w)"
+  fi
+else
+  # fake-symlink platform: forced symlink mode must refuse the fake and
+  # fall back to a REAL directory, recording the mode it actually used
+  assert "forced symlink degrades to copy on fake-symlink platforms" \
+    bash -c "cd '$TMP/repo2' && '$HUSK' link --mode symlink 2>/dev/null | grep -q 'mode=copy'"
+  ok "skip: no real symlinks here (MSYS without symlink privilege)"
+  ok "skip: no real symlinks here (MSYS without symlink privilege)"
+fi
 
 # ================= 6. doctor detects + fixes dangling links =================
-entry2=$(readlink "$TMP/repo2/node_modules")
-mv "$entry2" "$entry2.hidden"
-assert "doctor detects dangling link" bash -c "cd '$TMP/repo2' && '$HUSK' doctor | grep -q dangling"
-mv "$entry2.hidden" "$entry2"
-rm "$TMP/repo2/node_modules"; ln -s "$TMP/nowhere" "$TMP/repo2/node_modules"
-cd "$TMP/repo2"; "$HUSK" doctor --fix >/dev/null 2>&1 || true
-assert "doctor --fix repaired the link" test -e "$TMP/repo2/node_modules/left-pad/index.js"
-assert "doctor --fix preserved symlink mode" test -L "$TMP/repo2/node_modules"
+if [ "$HAVE_SYMLINK" = 1 ]; then
+  entry2=$(readlink "$TMP/repo2/node_modules")
+  mv "$entry2" "$entry2.hidden"
+  assert "doctor detects dangling link" bash -c "cd '$TMP/repo2' && '$HUSK' doctor | grep -q dangling"
+  mv "$entry2.hidden" "$entry2"
+  rm "$TMP/repo2/node_modules"; ln -s "$TMP/nowhere" "$TMP/repo2/node_modules"
+  cd "$TMP/repo2"; "$HUSK" doctor --fix >/dev/null 2>&1 || true
+  assert "doctor --fix repaired the link" test -e "$TMP/repo2/node_modules/left-pad/index.js"
+  assert "doctor --fix preserved symlink mode" test -L "$TMP/repo2/node_modules"
+else
+  ok "skip: no real symlinks here (dangling-link tests need them)"
+  ok "skip: no real symlinks here (dangling-link tests need them)"
+  ok "skip: no real symlinks here (dangling-link tests need them)"
+fi
 
 # ================= 7. unlink materializes a private copy =================
 cd "$TMP/repo2"
@@ -368,12 +399,17 @@ assert "link works with spaces in repo+store paths" bash -c "cd '$TMP/sp repo' &
 assert "add works with spaces everywhere" bash -c "cd '$TMP/sp repo' && HUSK_STORE='$TMP/sp store' '$HUSK' add '../sp wt' spb >/dev/null 2>&1 && test -e '$TMP/sp wt/node_modules/left-pad/index.js'"
 
 # store_guard resolves symlink aliases: alias pointing into the repo is refused
-mkdir -p "$TMP/repo/.mystore2"; ln -s "$TMP/repo/.mystore2" "$TMP/alias-store"
-assert_not "store via symlink alias into repo refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/alias-store' '$HUSK' link"
+if [ "$HAVE_SYMLINK" = 1 ]; then
+  mkdir -p "$TMP/repo/.mystore2"; ln -s "$TMP/repo/.mystore2" "$TMP/alias-store"
+  assert_not "store via symlink alias into repo refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/alias-store' '$HUSK' link"
 
-# ...while a legitimately external symlinked store still works
-mkdir -p "$TMP/real-store"; ln -s "$TMP/real-store" "$TMP/store-link"
-assert "external symlinked store works" bash -c "cd '$TMP/cf' && HUSK_STORE='$TMP/store-link' '$HUSK' link | grep -q linked"
+  # ...while a legitimately external symlinked store still works
+  mkdir -p "$TMP/real-store"; ln -s "$TMP/real-store" "$TMP/store-link"
+  assert "external symlinked store works" bash -c "cd '$TMP/cf' && HUSK_STORE='$TMP/store-link' '$HUSK' link | grep -q linked"
+else
+  ok "skip: no real symlinks here (store alias tests need them)"
+  ok "skip: no real symlinks here (store alias tests need them)"
+fi
 
 # ================= 17. stress: hostile names + big tree (opt-in: HUSK_STRESS=1) =================
 if [ "${HUSK_STRESS:-0}" = "1" ]; then

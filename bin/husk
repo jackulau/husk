@@ -50,18 +50,34 @@ batch_perms() { # tree -> "PERMS path" lines (batched stat, few forks)
 
 abspath() { (cd "$1" 2>/dev/null && pwd -P); }
 
+posix_path() { # git.exe on Windows emits C:/-style paths; hashing or comparing
+  # them against the shell's POSIX view silently splits the store namespace
+  case "$1" in
+    [A-Za-z]:*) if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; return 0; fi ;;
+  esac
+  printf '%s' "$1"
+}
+
+posix_path_stream() { # stdin: one path per line -> POSIX view (no-op off Windows)
+  if command -v cygpath >/dev/null 2>&1; then cygpath -u -f -; else cat; fi
+}
+
 # ---------- repo context ----------
-repo_root() { git rev-parse --show-toplevel 2>/dev/null || die "not inside a git repository"; }
+repo_root() {
+  local r; r=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
+  posix_path "$r"
+}
 
 repo_common_dir() {
   local c; c=$(git rev-parse --git-common-dir)
+  c=$(posix_path "$c")
   case "$c" in /*) ;; *) c="$(pwd)/$c" ;; esac
   abspath "$c"
 }
 
 repo_id() { printf '%s' "$(repo_common_dir)" | sha256 | cut -c1-12; }
 
-main_worktree() { git worktree list --porcelain | head -1 | sed 's/^worktree //'; }
+main_worktree() { git worktree list --porcelain | head -1 | sed 's/^worktree //' | posix_path_stream; }
 
 exclude_husk_dir() { # keep .husk/ out of git status without touching the repo
   local ex; ex=$(git rev-parse --git-path info/exclude 2>/dev/null) || return 0
@@ -574,7 +590,12 @@ provision() { # entry target mode
       chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
       tmp="$target.husk-tmp.$$"
       rm -f "$tmp"
-      ln -s "$entry" "$tmp"
+      ln -s "$entry" "$tmp" 2>/dev/null || { rm_rf_safe "$tmp"; return 1; }
+      # MSYS/Git Bash without symlink privilege fakes 'ln -s' with a COPY:
+      # recording mode=symlink over a copy would claim sharing that isn't
+      # happening (and drag store metadata into the worktree). Fail instead;
+      # link_one falls back to copy and records the truth.
+      [ -L "$tmp" ] || { rm_rf_safe "$tmp"; return 1; }
       swap_in "$tmp" "$target" || { rm -f "$tmp"; return 1; } ;;
     copy)
       tmp="$target.husk-tmp.$$"
@@ -949,7 +970,7 @@ cmd_reap() {
   root=$(repo_root); load_conf "$root"
   main=$(main_worktree); def=$(default_branch); now=$(date +%s)
 
-  git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | while read -r wt; do
+  git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | posix_path_stream | while read -r wt; do
     [ "$wt" = "$main" ] && continue
     [ "$wt" = "$root" ] && continue                       # never reap where we stand
     [ -d "$wt" ] || continue
@@ -957,7 +978,8 @@ cmd_reap() {
     if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then continue; fi
     # age: last activity = max(worktree HEAD-file mtime, last commit time).
     # NOT the index mtime - 'git status' (incl. our own clean check) refreshes it.
-    idx=$(git -C "$wt" rev-parse --git-dir 2>/dev/null || echo "$wt/.git")
+    idx=$(git -C "$wt" rev-parse --git-dir 2>/dev/null | posix_path_stream)
+    [ -n "$idx" ] || idx="$wt/.git"
     local act1 act2 activity
     act1=$(mtime_of "$idx/HEAD" 2>/dev/null || echo "$now")
     act2=$(git -C "$wt" log -1 --format=%ct 2>/dev/null || echo "$now")
@@ -1010,7 +1032,7 @@ cmd_gc() {
   # advisory only - a process killed between state_set and add_ref leaves a
   # live worktree with no ref, and trusting refs alone would delete an entry
   # that worktree's symlink still points into.
-  wt_list=$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p')
+  wt_list=$(git worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | posix_path_stream)
   find "$base" -mindepth 2 -maxdepth 2 -type d ! -name '*.lock' ! -name '*.tmp.*' | while read -r entry; do
     # never touch an entry mid-seed (lock held) or younger than 10 minutes:
     # a sibling 'husk link' may have seeded it but not yet written its ref
