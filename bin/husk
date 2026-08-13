@@ -169,11 +169,19 @@ find_fingerprint_file() { # root dir -> path of first existing lockfile (or mani
   printf ''
 }
 
+os_tag() { # stable OS identity for store keys. MSYS bakes the Windows build
+  # into 'uname -s' (MINGW64_NT-10.0-26200): left raw, every Windows update
+  # would silently re-key the whole store and force a full reseed.
+  local s; s=$(uname -s)
+  case "$s" in MINGW*_NT*|MSYS_NT*|CYGWIN_NT*) s="${s%%-*}" ;; esac
+  printf '%s' "$s"
+}
+
 key_for() { # root dir -> content key (or empty if unfingerprintable)
   local root="$1" dir="$2" fp
   fp=$(find_fingerprint_file "$root" "$dir")
   [ -n "$fp" ] || { printf ''; return 0; }
-  { printf '%s\n%s-%s\n' "$dir" "$(uname -s)" "$(uname -m)"; cat "$fp"; } | sha256 | cut -c1-16
+  { printf '%s\n%s-%s\n' "$dir" "$(os_tag)" "$(uname -m)"; cat "$fp"; } | sha256 | cut -c1-16
 }
 
 detect_dirs() { # root -> dep dirs relevant to this repo (exists OR its lockfile exists)
@@ -821,6 +829,22 @@ cmd_unlink() {
       fi
       strip_meta "$tmp"
       rm -f "$target"; mv "$tmp" "$target"
+    fi
+    if [ ! -L "$target" ] && [ "$mode" = "hardlink" ] && [ -d "$target" ]; then
+      # hardlink farm: every file still shares an inode with the store entry,
+      # so a post-unlink in-place edit (>>, patch) would poison the store and
+      # every sibling provisioned from it. "Stop sharing" must break the
+      # links: rebuild from the CURRENT tree (local edits survive), CoW where
+      # the filesystem has it, plain copy otherwise.
+      tmp="$target.husk-tmp.$$"
+      HUSK_CLEAN_TMP="$tmp"
+      rm_rf_safe "$tmp"
+      cow_clone "$target" "$tmp" || plain_copy "$target" "$tmp" \
+        || { HUSK_CLEAN_TMP=""; die "$d: could not materialize private copy (disk full?)"; }
+      strip_meta "$tmp"
+      swap_in "$tmp" "$target" \
+        || { rm_rf_safe "$tmp"; HUSK_CLEAN_TMP=""; die "$d: could not swap in private copy"; }
+      HUSK_CLEAN_TMP=""
     fi
     [ -d "$target" ] && chmod u+w "$target" 2>/dev/null || true
     state_del "$root" "$d"

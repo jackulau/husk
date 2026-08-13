@@ -238,13 +238,13 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 81 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 85 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck bin/husk install.sh      # must stay clean (info-level notes are OK)
 ```
 
-CI runs the suite on every push: Ubuntu 24.04 and macOS with stress on, Windows
-native Git Bash, plus shellcheck (`.github/workflows/ci.yml`).
+CI runs the suite with stress on for every push, on Ubuntu 24.04, macOS, and
+Windows native Git Bash, plus shellcheck (`.github/workflows/ci.yml`).
 
 Before claiming Linux works, run the suite as a **non-root** user on a real
 distro. Root bypasses permission checks and hides an entire class of bugs:

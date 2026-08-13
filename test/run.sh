@@ -252,6 +252,22 @@ assert_not "fresh copy is a distinct inode" same_inode "$dd_store/$k1/blob.bin" 
 (cd "$TMP/dd" && "$HUSK" dedupe >/dev/null 2>&1)
 assert "husk dedupe re-links identical files" same_inode "$dd_store/$k1/blob.bin" "$dd_store/$k2/blob.bin"
 
+# ================= 13b. unlink breaks hardlink-farm sharing =================
+# hardlink mode leaves worktree files sharing inodes with the store entry;
+# unlink's contract is "stop sharing", so it must rebuild with private inodes
+# or a post-unlink in-place edit would poison every sibling worktree
+make_repo "$TMP/hl" "hl-lock-v1"
+cd "$TMP/hl"
+"$HUSK" link --mode hardlink >/dev/null 2>&1
+"$HUSK" add "$TMP/hl-wt" hl-b --mode hardlink >/dev/null 2>&1
+hl_key=$(cd "$TMP/hl-wt" && "$HUSK" status | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+hl_entry=$(find "$HUSK_STORE" -type d -name "$hl_key" -print -quit)
+assert "hardlink worktree shares inodes with store" same_inode "$hl_entry/left-pad/index.js" "$TMP/hl-wt/node_modules/left-pad/index.js"
+(cd "$TMP/hl-wt" && "$HUSK" unlink node_modules >/dev/null 2>&1)
+assert_not "unlink broke the inode sharing" same_inode "$hl_entry/left-pad/index.js" "$TMP/hl-wt/node_modules/left-pad/index.js"
+echo "private edit" >> "$TMP/hl-wt/node_modules/left-pad/index.js"
+assert "post-unlink edit does not poison the store" bash -c "! grep -q 'private edit' '$hl_entry/left-pad/index.js'"
+
 # ================= 14. hardening: stampede, residue sweep, store guard =================
 # installer stampede: 3 concurrent 'link --install' on the same store miss must run ONE installer
 mkdir -p "$TMP/shim"
@@ -410,6 +426,20 @@ else
   ok "skip: no real symlinks here (store alias tests need them)"
   ok "skip: no real symlinks here (store alias tests need them)"
 fi
+
+# store key must survive a Windows update: MSYS bakes the OS build number into
+# 'uname -s', which would re-key (and force a reseed of) the whole store
+mkdir -p "$TMP/us1" "$TMP/us2"
+cat > "$TMP/us1/uname" <<'US'
+#!/bin/sh
+case "${1:-}" in -s) echo "MINGW64_NT-10.0-22000" ;; -m) echo "x86_64" ;; *) echo "MINGW64_NT" ;; esac
+US
+sed 's/22000/26200/' "$TMP/us1/uname" > "$TMP/us2/uname"
+chmod +x "$TMP/us1/uname" "$TMP/us2/uname"
+make_repo "$TMP/un" "un-lock-v1"
+kA=$(cd "$TMP/un" && PATH="$TMP/us1:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+kB=$(cd "$TMP/un" && PATH="$TMP/us2:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+assert "store key stable across Windows build numbers" test -n "$kA" -a "$kA" = "$kB"
 
 # ================= 17. stress: hostile names + big tree (opt-in: HUSK_STRESS=1) =================
 if [ "${HUSK_STRESS:-0}" = "1" ]; then
