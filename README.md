@@ -193,7 +193,7 @@ HUSK_MODE=auto                # auto | clone | hardlink | symlink | copy
 HUSK_DIRS="node_modules"      # override auto-detection
 HUSK_REAP_DAYS=7              # reap idle threshold
 HUSK_DEDUPE=1                 # hardlink identical files across store entries at seed time
-HUSK_NUDGE_SECS=3600          # how often 'husk add' probes for stale worktrees
+HUSK_NUDGE_SECS=86400         # how often 'husk add' probes for stale worktrees
 HUSK_LOCK_TIMEOUT=120         # seconds to wait for an orphaned lock
 HUSK_LOCK_TIMEOUT_BUSY=3600   # seconds to wait for a lock whose holder is alive (e.g. an installer)
 ```

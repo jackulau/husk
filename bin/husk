@@ -41,6 +41,7 @@ HUSK_RR_PWD=""
 HUSK_OS_TAG=""
 HUSK_ARCH=""
 HUSK_SHA_CMD=""    # resolved hasher: shasum -a 256 or sha256sum
+HUSK_DRIVE_SHORTCUT=-1   # -1 untested, 1 shell C:/ -> /c/ agrees with cygpath, 0 it does not
 HUSK_MAIN=""       # main_worktree
 HUSK_EXCLUDED=0    # exclude_husk_dir already ran
 HUSK_CONF_FOR=""   # root that load_conf was last run for
@@ -48,6 +49,7 @@ HUSK_CONF_FOR=""   # root that load_conf was last run for
 # next set_* of the same name; none of these survive a nested call.
 HUSK_PP=""; HUSK_ABS=""; HUSK_DIRN=""; HUSK_BASE=""
 HUSK_SF=""; HUSK_ENTRY=""; HUSK_KEY=""; HUSK_FP=""; HUSK_PROBE=""; HUSK_CANDS=""
+HUSK_REC=""
 HUSK_DEPDIRS=""
 HUSK_NL='
 '                  # a literal newline, for first-line-of trimming without `head`
@@ -136,13 +138,37 @@ set_posix_path() { # path -> $HUSK_PP
   eval "ck=\${${k}_K-}"
   if [ "$ck" = "$1" ]; then eval "HUSK_PP=\${${k}_V}"; return 0; fi
   case "$1" in
-    [A-Za-z]:*) HUSK_PP=$(cygpath -u "$1") ;;
-    /*)         HUSK_PP=$(cygpath -u "$(cygpath -m "$1")") ;;
+    [A-Za-z]:*) drive_to_posix "$1" ;;
+    /*)         HUSK_PP=$(cygpath -m "$1"); drive_to_posix "$HUSK_PP" ;;
     *)          HUSK_PP=$1; return 0 ;;
   esac
   eval "${k}_K=\$1; ${k}_V=\$HUSK_PP"
 }
 posix_path() { set_posix_path "$1"; printf '%s' "$HUSK_PP"; }
+
+drive_to_posix() { # C:/foo or C:\foo -> /c/foo, in the shell, setting $HUSK_PP
+  # `cygpath -u` costs a process (~1.5s here) for what is a two-character
+  # rewrite under the default MSYS mount table. Rather than assume the table is
+  # default, the first conversion of the process is checked against cygpath; if
+  # they disagree -- a custom /etc/fstab, a UNC path, a substed drive -- the
+  # shell shortcut is switched off for good and every path goes back through
+  # cygpath. One exec to buy certainty, then none.
+  local d=${1%%:*} r=${1#*:} i up=ABCDEFGHIJKLMNOPQRSTUVWXYZ lo=abcdefghijklmnopqrstuvwxyz cg
+  r=${r//\\//}
+  case "$d" in
+    [a-z]) ;;
+    [A-Z]) i=${up%%"$d"*}; d=${lo:${#i}:1} ;;
+    *)     HUSK_PP=$(cygpath -u "$1"); return 0 ;;   # not a plain drive letter
+  esac
+  case "$r" in /*) ;; *) HUSK_PP=$(cygpath -u "$1"); return 0 ;; esac  # C:rel, not absolute
+  if [ "$HUSK_DRIVE_SHORTCUT" = 0 ]; then HUSK_PP=$(cygpath -u "$1"); return 0; fi
+  HUSK_PP="/$d$r"
+  if [ "$HUSK_DRIVE_SHORTCUT" = -1 ]; then
+    cg=$(cygpath -u "$1")
+    if [ "$cg" = "$HUSK_PP" ]; then HUSK_DRIVE_SHORTCUT=1
+    else HUSK_DRIVE_SHORTCUT=0; HUSK_PP=$cg; fi
+  fi
+}
 
 posix_path_stream() { # stdin: one path per line -> POSIX view (no-op off Windows)
   if [ "$HUSK_HAVE_CYGPATH" = 1 ]; then cygpath -u -f -; else cat; fi
@@ -164,7 +190,26 @@ set_repo_common_dir() { # -> $HUSK_RCD
   # exactly what makes one store namespace serve a repo and all its worktrees,
   # so a single resolution is valid for the whole process.
   [ -z "$HUSK_RCD" ] || return 0
-  local c; c=$(git rev-parse --git-common-dir)
+  local c=""
+  # Derive it from the checkout before paying `git rev-parse` a process. The
+  # layout is fixed: a main checkout has .git as a directory, a linked worktree
+  # has .git as a file reading "gitdir: <common>/worktrees/<name>". Anything the
+  # derivation cannot confirm -- an env override, a relative gitdir, a bare or
+  # unusual repo -- falls through to git, which is always authoritative.
+  if [ -z "${GIT_DIR:-}" ] && [ -z "${GIT_COMMON_DIR:-}" ]; then
+    set_repo_root
+    if [ -d "$HUSK_RR/.git" ]; then
+      c="$HUSK_RR/.git"
+    elif [ -f "$HUSK_RR/.git" ]; then
+      local gd; read -r _ gd < "$HUSK_RR/.git" 2>/dev/null || gd=""
+      case "$gd" in
+        /*|[A-Za-z]:*) case "$gd" in */worktrees/*) c="${gd%/worktrees/*}" ;; esac ;;
+      esac
+    fi
+    # confirm the guess actually IS a git dir before trusting it
+    [ -n "$c" ] && [ -f "$c/config" ] || c=""
+  fi
+  [ -n "$c" ] || c=$(git rev-parse --git-common-dir)
   set_posix_path "$c"; c=$HUSK_PP
   case "$c" in /*) ;; *) c="$PWD/$c" ;; esac
   set_abspath "$c"; HUSK_RCD=$HUSK_ABS
@@ -174,8 +219,18 @@ repo_common_dir() { set_repo_common_dir; printf '%s' "$HUSK_RCD"; }
 set_repo_id() { # -> $HUSK_REPO_ID
   [ -z "$HUSK_REPO_ID" ] || return 0
   set_repo_common_dir
-  local h; h=$(printf '%s' "$HUSK_RCD" | sha256)
+  # Cached in the git common dir, because hashing costs a pipeline (~5s here)
+  # and the answer is a pure function of a path that cannot change while the
+  # cache file sits inside it. The path is stored beside the id and compared:
+  # move the repo and the id must change, so a stale line is ignored, not used.
+  local cf="$HUSK_RCD/husk-repo-id" cid cpath h
+  if [ -f "$cf" ]; then
+    IFS=$HUSK_TAB read -r cid cpath < "$cf" 2>/dev/null || true
+    if [ -n "$cid" ] && [ "$cpath" = "$HUSK_RCD" ]; then HUSK_REPO_ID=$cid; return 0; fi
+  fi
+  h=$(printf '%s' "$HUSK_RCD" | sha256)
   HUSK_REPO_ID=${h:0:12}
+  printf '%s\t%s\n' "$HUSK_REPO_ID" "$HUSK_RCD" > "$cf" 2>/dev/null || true
 }
 repo_id() { set_repo_id; printf '%s' "$HUSK_REPO_ID"; }
 
@@ -192,12 +247,22 @@ set_main_worktree() { # -> $HUSK_MAIN
 main_worktree() { set_main_worktree; printf '%s' "$HUSK_MAIN"; }
 
 exclude_husk_dir() { # keep .husk/ out of git status without touching the repo
-  # Idempotent, so the second and later callers in one process are a no-op
-  # rather than another git + grep.
+  # Idempotent, so the second and later callers in one process are a no-op.
+  # info/exclude lives in the COMMON dir (it is shared by every worktree), which
+  # husk already knows, so this costs no processes at all: no `git rev-parse
+  # --git-path`, and the membership test is a read loop rather than a grep.
   if [ "$HUSK_EXCLUDED" = 1 ]; then return 0; fi
-  local ex; ex=$(git rev-parse --git-path info/exclude 2>/dev/null) || return 0
-  dir_of "$ex"; mkdir -p "$HUSK_DIRN"
-  grep -qx '\.husk/' "$ex" 2>/dev/null || printf '.husk/\n' >> "$ex"
+  set_repo_common_dir
+  local ex="$HUSK_RCD/info/exclude" line
+  [ -n "$HUSK_RCD" ] || return 0
+  if [ -f "$ex" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = ".husk/" ]; then HUSK_EXCLUDED=1; return 0; fi
+    done < "$ex"
+  else
+    mkdir -p "$HUSK_RCD/info" 2>/dev/null || return 0
+  fi
+  printf '.husk/\n' >> "$ex" 2>/dev/null || true
   HUSK_EXCLUDED=1
 }
 
@@ -506,17 +571,49 @@ set_probe_mode() { # storefs wtfs -> $HUSK_PROBE, the best mode between them
   # each other's file mid-ladder and silently downgrade both to copy mode
   local probe="$storefs/.husk-probe.$$" t="$wtfs/.husk-probe.$$"
   if [ "$HUSK_MODE" != "auto" ]; then HUSK_PROBE=$HUSK_MODE; return 0; fi
+
+  # Disk cache. Walking the ladder costs three exec'd copy attempts (~12s on
+  # Windows) to re-derive a fact about two filesystems that does not change
+  # between runs. Keyed on the store plus the worktree's PARENT, because the
+  # worktree itself is new on every `husk add` while its parent is where the
+  # whole fleet lives.
+  #
+  # Only a SHARING answer is ever written. That asymmetry is the safety
+  # property: a stale entry can only claim MORE sharing than the filesystems
+  # now support, and provision() already catches that and falls back to copy,
+  # loudly. A stale "copy" would silently stop sharing forever, so "copy" is
+  # never cached and gets re-probed every time.
+  local ck cf cmode ckey
+  dir_of "$wtfs"; ck="$storefs|$HUSK_DIRN"
+  if [ "${HUSK_PROBE_CACHE:-1}" = "1" ]; then
+    set_repo_common_dir; cf="$HUSK_RCD/husk-probe-cache"
+    if [ -f "$cf" ]; then
+      while IFS=$HUSK_TAB read -r cmode ckey; do
+        if [ "$ckey" = "$ck" ]; then HUSK_PROBE=$cmode; return 0; fi
+      done < "$cf"
+    fi
+  else
+    cf=""
+  fi
+
   mkdir -p "$storefs" "$wtfs"
   echo probe > "$probe"
-  if cow_clone "$probe" "$t"; then rm -f "$t" "$probe"; HUSK_PROBE=clone; return 0; fi
-  if ln "$probe" "$t" 2>/dev/null; then rm -f "$t" "$probe"; HUSK_PROBE=hardlink; return 0; fi
+  if cow_clone "$probe" "$t"; then rm -f "$t" "$probe"; HUSK_PROBE=clone; probe_cache_put "$cf" "$ck"; return 0; fi
+  if ln "$probe" "$t" 2>/dev/null; then rm -f "$t" "$probe"; HUSK_PROBE=hardlink; probe_cache_put "$cf" "$ck"; return 0; fi
   # verify symlinks are REAL here: MSYS/Git Bash "ln -s" silently copies unless
   # symlink privilege is enabled, which would fake sharing while eating full disk
   if ln -s "$probe" "$t" 2>/dev/null && [ -L "$t" ]; then
-    rm -f "$t" "$probe"; HUSK_PROBE=symlink; return 0
+    rm -f "$t" "$probe"; HUSK_PROBE=symlink; probe_cache_put "$cf" "$ck"; return 0
   fi
   rm -f "$t" "$probe"
   HUSK_PROBE=copy
+}
+
+probe_cache_put() { # cachefile key -> record $HUSK_PROBE for this filesystem pair
+  # A short append, so concurrent writers interleave whole lines rather than
+  # tearing one; a duplicate line is harmless because the first match wins.
+  [ -n "$1" ] || return 0
+  printf '%s\t%s\n' "$HUSK_PROBE" "$2" >> "$1" 2>/dev/null || true
 }
 probe_mode() { set_probe_mode "$1" "$2"; printf '%s' "$HUSK_PROBE"; }
 
@@ -524,11 +621,18 @@ probe_mode() { set_probe_mode "$1" "$2"; printf '%s' "$HUSK_PROBE"; }
 set_state_file() { HUSK_SF="$1/.husk/state"; }   # root -> $HUSK_SF
 state_file() { printf '%s/.husk/state' "$1"; }
 
-state_get() { # root dir -> "key mode" or empty
-  local sf; set_state_file "$1"; sf=$HUSK_SF
+set_state_get() { # root dir -> $HUSK_REC, "key mode" or empty
+  # A three-column lookup in a file with a handful of rows does not need awk,
+  # and `rec=$(state_get ...)` cost a fork on top of the exec.
+  local sf d k m
+  HUSK_REC=""
+  set_state_file "$1"; sf=$HUSK_SF
   [ -f "$sf" ] || return 0
-  awk -F'\t' -v d="$2" '$1==d {print $2, $3}' "$sf"
+  while IFS=$HUSK_TAB read -r d k m; do
+    if [ "$d" = "$2" ]; then HUSK_REC="$k $m"; return 0; fi
+  done < "$sf"
 }
+state_get() { set_state_get "$1" "$2"; printf '%s' "$HUSK_REC"; }
 
 state_set() { # root dir key mode
   # read-filter-rewrite under the state lock: two concurrent husk processes
@@ -555,8 +659,15 @@ state_del() { # root dir
 }
 
 add_ref() { # entry worktree-root
-  local refs="$1.refs"
-  grep -qxF "$2" "$refs" 2>/dev/null || printf '%s\n' "$2" >> "$refs"
+  # Read loop rather than `grep -qxF`: the ref list is one line per worktree and
+  # this runs on every link, so it is not worth a process.
+  local refs="$1.refs" line
+  if [ -f "$refs" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ "$line" = "$2" ] && return 0
+    done < "$refs"
+  fi
+  printf '%s\n' "$2" >> "$refs"
 }
 
 del_ref() { # entry worktree-root
@@ -843,7 +954,7 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
   fi
 
   # idempotence: already linked to the right entry?
-  rec=$(state_get "$root" "$dir")
+  set_state_get "$root" "$dir"; rec=$HUSK_REC
   if [ -n "$rec" ] && [ "${rec%% *}" = "$key" ]; then
     if [ -L "$target" ] && [ "$(readlink "$target")" = "$entry" ] && [ -d "$entry" ]; then
       out "linked dir=$dir mode=symlink key=$key entry=$entry (already)"
@@ -1020,14 +1131,18 @@ cmd_add() {
   fi
   set_abspath "$path"; out "worktree path=$HUSK_ABS"
 
-  # opportunistic reap nudge (no daemon; fleet stays bounded). The probe walks
-  # every worktree, so throttle it to hourly: at 100 worktrees an unthrottled
-  # probe makes every 'husk add' pay ~100 'git status' calls
+  # Opportunistic reap nudge (no daemon; fleet stays bounded). The probe is a
+  # full reap dry-run, which costs a handful of git invocations PER WORKTREE --
+  # at the 20-100 worktrees husk is built for, that is the most expensive thing
+  # `husk add` does, and it lands on whichever add happens to cross the window.
+  # A stale-worktree hint is not time-critical, so the window is a day rather
+  # than an hour: same warning, 24x less amortised cost. HUSK_NUDGE_SECS still
+  # overrides it, and 0 forces the probe every time.
   local stale stamp nowts last
   set_repo_common_dir; stamp="$HUSK_RCD/husk-reap-probe"
   now_ts; nowts=$HUSK_NOW; last=$(cat "$stamp" 2>/dev/null || echo 0)
   case "$last" in *[!0-9]*|"") last=0 ;; esac
-  if [ $((nowts - last)) -ge "${HUSK_NUDGE_SECS:-3600}" ]; then
+  if [ $((nowts - last)) -ge "${HUSK_NUDGE_SECS:-86400}" ]; then
     printf '%s' "$nowts" > "$stamp" 2>/dev/null || true
     stale=$(cmd_reap --dry-run --quiet | grep -c '^reap ' || true)
     [ "$stale" -gt 0 ] && note "$stale stale worktree(s) detected; run 'husk reap' to clean up"
@@ -1043,7 +1158,8 @@ cmd_unlink() {
   [ $# -gt 0 ] && dirs="$*" || dirs=$(awk -F'\t' '{print $1}' "$HUSK_SF" 2>/dev/null || true)
   [ -n "${dirs// /}" ] || { note "nothing linked"; return 0; }
   for d in $dirs; do
-    rec=$(state_get "$root" "$d"); [ -n "$rec" ] || { note "$d: not linked, skipping"; continue; }
+    set_state_get "$root" "$d"; rec=$HUSK_REC
+    [ -n "$rec" ] || { note "$d: not linked, skipping"; continue; }
     key="${rec%% *}"; mode="${rec##* }"
     set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
     target="$root/$d"
@@ -1306,10 +1422,14 @@ cmd_reap() {
     [ "$wt" = "$main" ] && continue
     [ "$wt" = "$root" ] && continue                       # never reap where we stand
     [ -d "$wt" ] || continue
-    # clean?
-    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then continue; fi
-    # age: last activity = max(worktree HEAD-file mtime, last commit time).
-    # NOT the index mtime - 'git status' (incl. our own clean check) refreshes it.
+    # AGE FIRST, deliberately. `git status --porcelain` stats the entire working
+    # tree, which is the most expensive question asked here, and the answer is
+    # irrelevant for a worktree that is too young to reap. Since most of a fleet
+    # is young most of the time, checking age first skips the tree walk for
+    # nearly every worktree.
+    #
+    # Age = max(worktree HEAD-file mtime, last commit time). NOT the index
+    # mtime, which any `git status` refreshes.
     idx=$(git -C "$wt" rev-parse --git-dir 2>/dev/null | posix_path_stream)
     [ -n "$idx" ] || idx="$wt/.git"
     local act1 act2 activity
@@ -1318,6 +1438,8 @@ cmd_reap() {
     activity=$act1; [ "$act2" -gt "$activity" ] && activity=$act2
     age=$(( (now - activity) / 86400 ))
     [ "$age" -lt "$days" ] && continue
+    # clean?
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then continue; fi
     # merged or upstream gone?
     br=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
     head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
