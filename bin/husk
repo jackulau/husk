@@ -383,8 +383,25 @@ set_key_for() { # root dir -> $HUSK_KEY, content key (empty if unfingerprintable
   set_fingerprint_file "$1" "$2"; fp=$HUSK_FP
   [ -n "$fp" ] || { HUSK_KEY=""; return 0; }
   set_os_tag; set_arch_tag
-  # The key bytes are unchanged; only the truncation moved off `cut`.
-  h=$({ printf '%s\n%s-%s\n' "$2" "$HUSK_OS_TAG" "$HUSK_ARCH"; cat "$fp"; } | sha256)
+  # Line endings are stripped out of the key, because git puts them back
+  # differently in different checkouts. With core.autocrlf=true -- the Git for
+  # Windows default -- a lockfile committed with LF arrives in a fresh worktree
+  # as CRLF, so the same dependency tree fingerprints differently in the main
+  # checkout and in every worktree made from it, and husk misses its own store
+  # on every single `husk add`. Nothing breaks loudly; sharing just silently
+  # never happens, which is the worst failure this tool has.
+  #
+  # Safe because a lockfile's meaning does not depend on its line endings: two
+  # files that differ only there describe the same tree, so sharing between
+  # them is correct. bun.lockb is the one binary candidate and is hashed raw,
+  # where a stray 0x0d is data, not a line ending.
+  #
+  # This costs no extra process: `tr` replaces the `cat` that was already here.
+  base_of "$fp"
+  case "$HUSK_BASE" in
+    *.lockb) h=$({ printf '%s\n%s-%s\n' "$2" "$HUSK_OS_TAG" "$HUSK_ARCH"; cat "$fp"; } | sha256) ;;
+    *)       h=$({ printf '%s\n%s-%s\n' "$2" "$HUSK_OS_TAG" "$HUSK_ARCH"; tr -d '\r' < "$fp"; } | sha256) ;;
+  esac
   HUSK_KEY=${h:0:16}
 }
 key_for() { set_key_for "$1" "$2"; printf '%s' "$HUSK_KEY"; }

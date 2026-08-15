@@ -465,6 +465,20 @@ kA=$(cd "$TMP/un" && PATH="$TMP/us1:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's
 kB=$(cd "$TMP/un" && PATH="$TMP/us2:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
 assert "store key stable across Windows build numbers" test -n "$kA" -a "$kA" = "$kB"
 
+# store key must survive git's line-ending rewriting. core.autocrlf=true is the
+# Git for Windows default, so a lockfile committed with LF lands in a fresh
+# worktree as CRLF: key by raw bytes and husk misses its own store on every add,
+# silently, forever. Same content, two spellings, one key.
+make_repo "$TMP/crlf" "crlf-lock-v1"
+kLF=$(cd "$TMP/crlf" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+printf 'crlf-lock-v1\r\n' > "$TMP/crlf/package-lock.json"
+kCRLF=$(cd "$TMP/crlf" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+assert "store key ignores CRLF vs LF in the lockfile" test -n "$kLF" -a "$kLF" = "$kCRLF"
+# ...but content still keys: a real change must still get its own entry
+printf 'crlf-lock-v2\r\n' > "$TMP/crlf/package-lock.json"
+kV2=$(cd "$TMP/crlf" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+assert "lockfile content still keys" test -n "$kV2" -a "$kV2" != "$kLF"
+
 # repo_id must not depend on which MSYS mount spelling the cwd used: /tmp and
 # /c/Users/.../Temp are the same dir on native Git Bash, and mixed spellings
 # split the store namespace (adopt seeded one id, add provisioned another)
