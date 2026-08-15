@@ -210,13 +210,24 @@ steal_lock() { # lockdir expected-dead-pid -> 0 stolen, 1 lost the race
   # dir still holds the pid we judged dead. A plain rm -rf here would let a
   # slow second stealer wipe the lock a THIRD process just legitimately
   # acquired; with rename+verify the mistake is detectable and undone.
-  local lock="$1" dead="$2" got
+  local lock="$1" dead="$2" got age
   mv "$lock" "$lock.stale.$$" 2>/dev/null || return 1
   got=$(cat "$lock.stale.$$/pid" 2>/dev/null || echo "")
-  if [ "$got" != "$dead" ] && [ -n "$got" ] && kill -0 "$got" 2>/dev/null; then
+  if [ -n "$got" ] && [ "$got" != "$dead" ] && kill -0 "$got" 2>/dev/null; then
     # captured a LIVE holder's fresh lock by mistake: give it back
     mv "$lock.stale.$$" "$lock" 2>/dev/null || rm -rf "$lock.stale.$$"
     return 1
+  fi
+  if [ -z "$got" ]; then
+    # pid-less capture: either the orphan we judged dead, or a FRESH lock
+    # caught between its mkdir and its pid write. Only age tells them apart
+    # (rename does not touch the dir's own mtime, so it survives the mv):
+    # young means fresh acquisition, give it back.
+    age=$(( $(date +%s) - $(mtime_of "$lock.stale.$$" 2>/dev/null || echo 0) ))
+    if [ "$age" -le 30 ]; then
+      mv "$lock.stale.$$" "$lock" 2>/dev/null || rm -rf "$lock.stale.$$"
+      return 1
+    fi
   fi
   rm -rf "$lock.stale.$$"
   return 0
@@ -224,7 +235,19 @@ steal_lock() { # lockdir expected-dead-pid -> 0 stolen, 1 lost the race
 
 acquire_lock() { # lockdir
   local lock="$1" waited=0 pid age
-  while ! mkdir "$lock" 2>/dev/null; do
+  while :; do
+    if mkdir "$lock" 2>/dev/null; then
+      # publish ownership, then confirm the lock survived the publish window:
+      # a stealer that captured the dir before our pid landed leaves us
+      # lockless (the pid write lands nowhere), so re-enter the wait loop
+      # instead of proceeding unlocked.
+      echo $$ > "$lock/pid" 2>/dev/null || true
+      if [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ]; then
+        HUSK_CLEAN_LOCK="$lock"
+        return 0
+      fi
+      continue
+    fi
     pid=$(cat "$lock/pid" 2>/dev/null || echo "")
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
       note "stealing stale lock (dead pid $pid): $lock"
@@ -250,8 +273,6 @@ acquire_lock() { # lockdir
     fi
     sleep 1; waited=$((waited + 1))
   done
-  echo $$ > "$lock/pid"
-  HUSK_CLEAN_LOCK="$lock"
 }
 release_lock() { rm -rf "$1"; HUSK_CLEAN_LOCK=""; }
 
@@ -620,6 +641,9 @@ provision() { # entry target mode
       chmod u+w "$target" 2>/dev/null || true ;;
     *) die "unknown mode: $mode" ;;
   esac
+  # re-stamp on completion: a copy that itself took longer than gc's grace
+  # would otherwise finish with an already-expired stamp
+  date +%s > "$entry.used" 2>/dev/null || true
 }
 
 # ---------- installer detection ----------
@@ -1210,7 +1234,7 @@ ENV
   HUSK_REAP_DAYS  reap idle threshold (default 7)
   HUSK_DEDUPE     hardlink identical files across store entries at seed time (default 1)
 
-Config file: .husk.conf at repo root (shell syntax: HUSK_DIRS="node_modules .venv" etc.)
+Config file: .husk.conf at repo root (KEY=VALUE lines, parsed not sourced: HUSK_DIRS="node_modules .venv" etc.)
 Output: stdout is stable key=value lines; humans read stderr.
 Exit codes: 0 ok - 2 needs install - 1 error
 EOF

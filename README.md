@@ -236,7 +236,7 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 85 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 91 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck --severity=warning bin/husk install.sh test/run.sh   # must stay clean
 ```
