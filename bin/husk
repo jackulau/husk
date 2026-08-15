@@ -477,11 +477,14 @@ HUSK_CLEAN_LOCK=""
 HUSK_CLEAN_TMP=""
 HUSK_PREFARM_TMP=""
 HUSK_PREFARM_PID=""
+HUSK_WINFARM_PS=""
+HUSK_CLEAN_PS=""
 PROBE_CACHE_KEY=""
 PROBE_CACHE_VAL=""
 husk_cleanup() {
   [ -n "$HUSK_CLEAN_TMP" ] && rm_rf_safe "$HUSK_CLEAN_TMP" 2>/dev/null
   [ -n "$HUSK_CLEAN_LOCK" ] && rm -rf "$HUSK_CLEAN_LOCK" 2>/dev/null
+  [ -n "$HUSK_CLEAN_PS" ] && rm -f "$HUSK_CLEAN_PS" 2>/dev/null
   if [ -n "$HUSK_PREFARM_TMP" ]; then
     [ -n "$HUSK_PREFARM_PID" ] && kill "$HUSK_PREFARM_PID" 2>/dev/null
     wait 2>/dev/null || true
@@ -528,7 +531,110 @@ cow_clone() { # src dst -> 0 if CoW clone succeeded; never leaves a partial dst
   return 1                  # modes, possibly read-only); residue would jam every fallback
 }
 
+win_farm() { # src dst -> 0 on success, 1 to fall through to the portable chain
+  # MSYS `cp -al` pays POSIX emulation and path translation on every one of a
+  # node_modules' ~21,000 files. A native CreateHardLinkW walk pays neither:
+  # measured 17.8s against cp -al's 25.3s and perl's 22.6s on the same tree,
+  # all three producing identical trees with shared inodes.
+  #
+  # Strictly first-choice-with-fallback: any failure here (no powershell, no
+  # C# compiler, a reparse point, one failed link) returns 1 and hardlink_farm
+  # continues down the chain it always used, so this Windows-only branch can
+  # rot without ever becoming a correctness risk.
+  [ "$HUSK_HAVE_CYGPATH" = 1 ] || return 1
+  [ "${HUSK_WINFARM:-1}" = "1" ] || return 1
+  command -v powershell >/dev/null 2>&1 || return 1
+
+  # Size gate, paid for with a glob instead of a walk. PowerShell startup plus
+  # the Add-Type compile costs a couple of seconds flat, which LOSES to cp -al
+  # on a small tree -- but counting the tree to find out would cost more than
+  # the decision saves. Top-level children stand in for size: a real
+  # node_modules has hundreds of package directories, a fixture has three.
+  local min="${HUSK_WINFARM_MIN:-64}" n=0 f
+  for f in "$1"/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    n=$((n+1))
+    [ "$n" -ge "$min" ] && break
+  done
+  [ "$n" -ge "$min" ] || return 1
+
+  if [ -z "$HUSK_WINFARM_PS" ]; then
+    HUSK_WINFARM_PS="${TMPDIR:-/tmp}/husk-winfarm.$$.ps1"
+    HUSK_CLEAN_PS="$HUSK_WINFARM_PS"
+    cat > "$HUSK_WINFARM_PS" <<'HUSK_WINFARM_EOF'
+param([Parameter(Mandatory=$true)][string]$Src,
+      [Parameter(Mandatory=$true)][string]$Dst)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public static class HuskFarm {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+    public static int Errors = 0;
+    public static int Files = 0;
+
+    // node_modules nests past MAX_PATH; the \\?\ prefix is the only form
+    // CreateHardLinkW accepts for those.
+    static string Ext(string p) {
+        if (p.StartsWith(@"\\?\")) return p;
+        if (p.StartsWith(@"\\")) return @"\\?\UNC\" + p.Substring(2);
+        return @"\\?\" + p;
+    }
+
+    public static void Farm(string src, string dst) {
+        src = Path.GetFullPath(src);
+        dst = Path.GetFullPath(dst);
+        Directory.CreateDirectory(Ext(dst));
+        Walk(src, dst);
+    }
+
+    static void Walk(string src, string dst) {
+        foreach (string d in Directory.EnumerateDirectories(Ext(src))) {
+            string name = Path.GetFileName(d);
+            // A junction or symlink is not a directory to descend into, and
+            // this walker cannot reproduce one. Hand the tree back instead.
+            FileAttributes a = File.GetAttributes(Ext(d));
+            if ((a & FileAttributes.ReparsePoint) != 0) { Errors++; return; }
+            string target = Path.Combine(dst, name);
+            Directory.CreateDirectory(Ext(target));
+            Walk(Path.Combine(src, name), target);
+            if (Errors > 0) return;
+        }
+        foreach (string f in Directory.EnumerateFiles(Ext(src))) {
+            string name = Path.GetFileName(f);
+            if (!CreateHardLinkW(Ext(Path.Combine(dst, name)), Ext(Path.Combine(src, name)), IntPtr.Zero)) {
+                Errors++;
+                return;   // bail on first failure; the caller discards the partial tree
+            }
+            Files++;
+        }
+    }
+}
+'@
+try { [HuskFarm]::Farm($Src, $Dst) } catch { exit 1 }
+if ([HuskFarm]::Errors -gt 0) { exit 1 }
+exit 0
+HUSK_WINFARM_EOF
+  fi
+
+  local wsrc wdst wps
+  wsrc=$(cygpath -w "$1") || return 1
+  wdst=$(cygpath -w "$2") || return 1
+  wps=$(cygpath -w "$HUSK_WINFARM_PS") || return 1
+  if powershell -NoProfile -ExecutionPolicy Bypass -File "$wps" -Src "$wsrc" -Dst "$wdst" >/dev/null 2>&1; then
+    return 0
+  fi
+  rm_rf_safe "$2"
+  return 1
+}
+
 hardlink_farm() { # src dst -> 0 on success; never leaves a partial dst
+  if win_farm "$1" "$2"; then return 0; fi                      # native Win32
   if cp -al "$1" "$2" 2>/dev/null; then return 0; fi            # GNU cp
   rm_rf_safe "$2"
   if command -v perl >/dev/null 2>&1; then
@@ -556,6 +662,28 @@ hardlink_farm() { # src dst -> 0 on success; never leaves a partial dst
     rm_rf_safe "$2"
   fi
   return 1
+}
+
+make_junction() { # link entry -> 0 if a real directory junction now exists at $1
+  # Windows has three ways to point one directory at another and only one of
+  # them works unprivileged: a junction. MSYS `ln -s` without Developer Mode
+  # silently makes a COPY, which is why forced symlink mode used to degrade all
+  # the way to copy here and quietly stop sharing anything.
+  #
+  # Verified against every deletion path husk uses (rm -rf, mv + rm -rf, git
+  # worktree remove, and rm_rf_safe's chmod -R u+w + rm -rf): each removes the
+  # link and leaves the store target intact. MSYS also reports a junction as -L
+  # with a working readlink, so every check downstream that already handled a
+  # symlink handles this one unchanged.
+  [ "$HUSK_HAVE_CYGPATH" = 1 ] || return 1
+  [ "${HUSK_JUNCTION:-1}" = "1" ] || return 1
+  command -v cmd >/dev/null 2>&1 || return 1
+  local wl we
+  wl=$(cygpath -w "$1") || return 1
+  we=$(cygpath -w "$2") || return 1
+  cmd //c mklink //J "$wl" "$we" >/dev/null 2>&1 || return 1
+  # trust nothing: a junction that did not actually resolve is worse than none
+  [ -L "$1" ] && [ -d "$1" ]
 }
 
 plain_copy() { # src dst -> dst must not pre-exist (partial dst is removed, see cow_clone)
@@ -604,6 +732,18 @@ set_probe_mode() { # storefs wtfs -> $HUSK_PROBE, the best mode between them
   # symlink privilege is enabled, which would fake sharing while eating full disk
   if ln -s "$probe" "$t" 2>/dev/null && [ -L "$t" ]; then
     rm -f "$t" "$probe"; HUSK_PROBE=symlink; probe_cache_put "$cf" "$ck"; return 0
+  fi
+  rm -f "$t"
+  # Windows: no symlink privilege, but a junction links directories anyway.
+  # Probed with a directory because that is all a junction can point at, and
+  # all husk ever points at.
+  if mkdir -p "$storefs/.husk-jprobe.$$" 2>/dev/null; then
+    if make_junction "$t" "$storefs/.husk-jprobe.$$"; then
+      rm -f "$t"; rmdir "$storefs/.husk-jprobe.$$" 2>/dev/null
+      rm -f "$probe"; HUSK_PROBE=symlink; probe_cache_put "$cf" "$ck"; return 0
+    fi
+    rm -f "$t" 2>/dev/null; rm -rf "$t" 2>/dev/null
+    rmdir "$storefs/.husk-jprobe.$$" 2>/dev/null
   fi
   rm -f "$t" "$probe"
   HUSK_PROBE=copy
@@ -891,12 +1031,15 @@ provision() { # entry target mode
       chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
       tmp="$target.husk-tmp.$$"
       rm -f "$tmp"
-      ln -s "$entry" "$tmp" 2>/dev/null || { rm_rf_safe "$tmp"; return 1; }
-      # MSYS/Git Bash without symlink privilege fakes 'ln -s' with a COPY:
-      # recording mode=symlink over a copy would claim sharing that isn't
-      # happening (and drag store metadata into the worktree). Fail instead;
-      # link_one falls back to copy and records the truth.
-      [ -L "$tmp" ] || { rm_rf_safe "$tmp"; return 1; }
+      if ! { ln -s "$entry" "$tmp" 2>/dev/null && [ -L "$tmp" ]; }; then
+        # MSYS/Git Bash without symlink privilege fakes 'ln -s' with a COPY.
+        # Recording mode=symlink over a copy would claim sharing that isn't
+        # happening (and drag store metadata into the worktree), so the fake is
+        # thrown away and a junction -- the one directory link Windows grants
+        # an unprivileged user -- is tried in its place.
+        rm_rf_safe "$tmp"
+        make_junction "$tmp" "$entry" || { rm_rf_safe "$tmp"; return 1; }
+      fi
       swap_in "$tmp" "$target" || { rm -f "$tmp"; return 1; } ;;
     copy)
       tmp="$target.husk-tmp.$$"
@@ -956,7 +1099,10 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
   # idempotence: already linked to the right entry?
   set_state_get "$root" "$dir"; rec=$HUSK_REC
   if [ -n "$rec" ] && [ "${rec%% *}" = "$key" ]; then
-    if [ -L "$target" ] && [ "$(readlink "$target")" = "$entry" ] && [ -d "$entry" ]; then
+    # -ef, not readlink: it costs no subshell, and MSYS resolves a junction
+    # through its own mount table, so the same directory can read back under a
+    # different spelling than the one husk wrote.
+    if [ -L "$target" ] && [ -d "$entry" ] && [ "$target" -ef "$entry" ]; then
       out "linked dir=$dir mode=symlink key=$key entry=$entry (already)"
       return 0
     fi
@@ -1631,6 +1777,7 @@ MODES (--mode or HUSK_MODE; default: auto)
   clone     CoW clone (APFS/btrfs/XFS) - full isolation, bytes shared until divergence
   hardlink  hardlink farm - file-level dedupe, near-full isolation
   symlink   link to shared store entry - maximal dedupe, shared writes (guarded read-only root)
+            on Windows this is a directory junction, the one link an unprivileged user can make
   copy      plain copy - always correct, no savings
 
 ENV
@@ -1638,6 +1785,8 @@ ENV
   HUSK_MODE       default mode (default auto)
   HUSK_REAP_DAYS  reap idle threshold (default 7)
   HUSK_DEDUPE     hardlink identical files across store entries at seed time (default 1)
+  HUSK_WINFARM    Windows: native CreateHardLinkW farm, 0 to force the portable chain (default 1)
+  HUSK_JUNCTION   Windows: allow directory junctions for symlink mode (default 1)
 
 Config file: .husk.conf at repo root. KEY=VALUE lines, parsed and never sourced, so a
   cloned repo cannot run code on 'husk add'. Example: HUSK_DIRS=node_modules .venv

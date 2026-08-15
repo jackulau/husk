@@ -65,7 +65,7 @@ supports (the **strategy ladder**):
 |---|---|---|---|---|
 | `clone` | copy-on-write clone (APFS, btrfs, XFS) | shared until divergence | full: writes are private | **default on every Mac and CoW Linux** |
 | `hardlink` | hardlink farm | file-level dedupe | near-full | default on ext4 |
-| `symlink` | link into shared store | maximal: one tree, N consumers | none: writes shared (guarded) | opt-in, one-lockfile fleets |
+| `symlink` | link into shared store (a directory junction on Windows) | maximal: one tree, N consumers | none: writes shared (guarded) | opt-in, one-lockfile fleets |
 | `copy` | plain copy | none | full | last-resort fallback, always correct |
 
 `clone` is the sweet spot: ~95% of symlink's storage win, 100% of a real dir's
@@ -213,12 +213,18 @@ nothing else is.
   openssl or sha256sum (all present on any dev box).
 - **Windows (WSL)**: the Linux path above; suite green on Ubuntu 24.04 under
   WSL2.
-- **Windows (native Git Bash)**: supported, suite green (symlink-dependent
-  tests skip honestly). The probe lands on `hardlink` mode — NTFS hardlinks
-  are real. MSYS fakes `ln -s` with a copy unless Developer Mode is on, so
-  the probe never chooses symlink mode by itself, and even a forced
-  `--mode symlink` verifies the link and falls back to `copy` rather than
-  record sharing that isn't happening. Paths that native `git.exe` emits
+- **Windows (native Git Bash)**: supported, suite green. The probe lands on
+  `hardlink` mode — NTFS hardlinks are real. MSYS fakes `ln -s` with a copy
+  unless Developer Mode is on, so `--mode symlink` uses a **directory
+  junction** instead, which is the one directory link Windows grants an
+  unprivileged user; the link is verified after creation, and anything that
+  isn't a real link falls back to `copy` rather than record sharing that
+  isn't happening. Removing a worktree removes the junction and leaves the
+  store intact (checked against `rm -rf`, `git worktree remove`, and husk's
+  own force-writable delete). Hardlink farming goes through a native
+  `CreateHardLinkW` walk, which avoids MSYS path translation on every one of
+  a `node_modules`' 21,000 files; `HUSK_WINFARM=0` forces the portable
+  `cp -al` chain. Paths that native `git.exe` emits
   (`C:/...`) are normalized before being hashed or compared, so the store
   namespace is stable across the main checkout and its worktrees.
   **On Windows, expect a disk win and a time loss.** Measured on NTFS against

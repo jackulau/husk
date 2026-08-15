@@ -30,6 +30,27 @@ trap cleanup EXIT
 HAVE_SYMLINK=0
 ln -s "$TMP" "$TMP/.slprobe" 2>/dev/null && [ -L "$TMP/.slprobe" ] && HAVE_SYMLINK=1
 rm -rf "$TMP/.slprobe"
+# ...but Windows still links DIRECTORIES unprivileged, via a junction, which is
+# what husk's symlink mode uses there. Everything that only needs "the worktree
+# points at the store" tests HAVE_DIRLINK; only the tests that genuinely need
+# `ln -s` itself (store aliases) stay on HAVE_SYMLINK.
+HAVE_DIRLINK=$HAVE_SYMLINK
+if [ "$HAVE_DIRLINK" = 0 ] && command -v cygpath >/dev/null 2>&1 && command -v cmd >/dev/null 2>&1; then
+  mkdir -p "$TMP/.jtgt"
+  cmd //c mklink //J "$(cygpath -w "$TMP/.jprobe")" "$(cygpath -w "$TMP/.jtgt")" >/dev/null 2>&1
+  [ -L "$TMP/.jprobe" ] && [ -d "$TMP/.jprobe" ] && HAVE_DIRLINK=1
+  rm -rf "$TMP/.jprobe" "$TMP/.jtgt"
+fi
+# replace a live link with one pointing nowhere, whichever kind this box makes
+break_link() { # path -> 0 if $1 is now a dangling directory link
+  rm -rf "$1"
+  if ln -s "$TMP/nowhere" "$1" 2>/dev/null && [ -L "$1" ]; then return 0; fi
+  rm -rf "$1"
+  mkdir -p "$TMP/.gone" || return 1
+  cmd //c mklink //J "$(cygpath -w "$1")" "$(cygpath -w "$TMP/.gone")" >/dev/null 2>&1 || return 1
+  rmdir "$TMP/.gone" 2>/dev/null
+  [ -L "$1" ]
+}
 CAN_DIRGUARD=0
 mkdir "$TMP/.gdprobe" && chmod a-w "$TMP/.gdprobe" 2>/dev/null
 touch "$TMP/.gdprobe/x" 2>/dev/null || CAN_DIRGUARD=1
@@ -99,10 +120,13 @@ assert "both store entries coexist" test "$(find "$HUSK_STORE" -mindepth 3 -maxd
 # ================= 5. symlink mode + write guard =================
 make_repo "$TMP/repo2" "slock-v1"
 cd "$TMP/repo2" || exit 1
-if [ "$HAVE_SYMLINK" = 1 ]; then
-  "$HUSK" link --mode symlink >/dev/null 2>&1
-  assert "symlink mode: node_modules is a symlink" test -L "$TMP/repo2/node_modules"
-  assert "symlink resolves into store" bash -c "readlink '$TMP/repo2/node_modules' | grep -q '$HUSK_STORE'"
+if [ "$HAVE_DIRLINK" = 1 ]; then
+  slout=$("$HUSK" link --mode symlink 2>/dev/null)
+  slentry=$(printf '%s' "$slout" | sed -n 's/.*entry=\([^ ]*\).*/\1/p' | head -1)
+  assert "symlink mode: node_modules is a link" test -L "$TMP/repo2/node_modules"
+  # -ef, not a readlink string match: MSYS resolves a junction through its own
+  # mount table, so the same directory reads back under a different spelling
+  assert "symlink resolves to the store entry" test "$TMP/repo2/node_modules" -ef "$slentry"
   if [ "$CAN_DIRGUARD" = 1 ]; then
     assert "write guard: creating file at entry root fails" bash -c "! touch '$TMP/repo2/node_modules/newpkg' 2>/dev/null"
   else
@@ -111,26 +135,26 @@ if [ "$HAVE_SYMLINK" = 1 ]; then
 else
   # fake-symlink platform: forced symlink mode must refuse the fake and
   # fall back to a REAL directory, recording the mode it actually used
-  assert "forced symlink degrades to copy on fake-symlink platforms" \
+  assert "forced symlink degrades to copy where no directory link exists" \
     bash -c "cd '$TMP/repo2' && '$HUSK' link --mode symlink 2>/dev/null | grep -q 'mode=copy'"
-  ok "skip: no real symlinks here (MSYS without symlink privilege)"
-  ok "skip: no real symlinks here (MSYS without symlink privilege)"
+  ok "skip: no directory links here (neither symlink nor junction)"
+  ok "skip: no directory links here (neither symlink nor junction)"
 fi
 
 # ================= 6. doctor detects + fixes dangling links =================
-if [ "$HAVE_SYMLINK" = 1 ]; then
+if [ "$HAVE_DIRLINK" = 1 ]; then
   entry2=$(readlink "$TMP/repo2/node_modules")
   mv "$entry2" "$entry2.hidden"
   assert "doctor detects dangling link" bash -c "cd '$TMP/repo2' && '$HUSK' doctor | grep -q dangling"
   mv "$entry2.hidden" "$entry2"
-  rm "$TMP/repo2/node_modules"; ln -s "$TMP/nowhere" "$TMP/repo2/node_modules"
+  break_link "$TMP/repo2/node_modules"
   cd "$TMP/repo2" || exit 1; "$HUSK" doctor --fix >/dev/null 2>&1 || true
   assert "doctor --fix repaired the link" test -e "$TMP/repo2/node_modules/left-pad/index.js"
   assert "doctor --fix preserved symlink mode" test -L "$TMP/repo2/node_modules"
 else
-  ok "skip: no real symlinks here (dangling-link tests need them)"
-  ok "skip: no real symlinks here (dangling-link tests need them)"
-  ok "skip: no real symlinks here (dangling-link tests need them)"
+  ok "skip: no directory links here (dangling-link tests need them)"
+  ok "skip: no directory links here (dangling-link tests need them)"
+  ok "skip: no directory links here (dangling-link tests need them)"
 fi
 
 # ================= 7. unlink materializes a private copy =================
