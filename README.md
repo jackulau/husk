@@ -104,6 +104,18 @@ time is bounded by git's own worktree lock, not by husk. Store dedupe across two
 lockfile versions: the second entry cost 21 MB instead of 395 MB. Reproduce with
 `test/run.sh` plus the commands above.
 
+The table above is the APFS `clone`-mode best case. A second run on NTFS
+`hardlink` mode, against a real 404 MB / 22,015-file `node_modules` with total
+disk remeasured after every single `husk add`, puts the **marginal cost of each
+extra worktree at 6.70 MB against 405.01 MB**, a 60x saving, ahead from the second
+worktree onward. Totals including the store are 5.0x at ten worktrees, because the
+store holds one full copy; quote the marginal number or the total, but say which.
+
+That ratio is not a constant. It is roughly the tree's average bytes per file
+divided by the per-file directory overhead a hardlink farm still pays, about 310
+bytes per file on NTFS. Denser trees do better, and a tree of many tiny files does
+worse. Run `husk list` in your own repo for the number that applies to you.
+
 ## Commands
 
 ```
@@ -208,12 +220,18 @@ nothing else is.
   `--mode symlink` verifies the link and falls back to `copy` rather than
   record sharing that isn't happening. Paths that native `git.exe` emits
   (`C:/...`) are normalized before being hashed or compared, so the store
-  namespace is stable across the main checkout and its worktrees. Measured
-  on NTFS (333 MB, 9,800-file `node_modules`): `husk add` 5.7s vs 8.7s for
-  worktree+full-copy, ~2 MB of real disk per extra worktree, and a
-  one-package lockfile bump costs ~3 MB of store after dedupe, not 333 MB.
-  One-time `husk adopt` is ~17s; the very first run can be slower while
-  Windows Defender scans the freshly written files.
+  namespace is stable across the main checkout and its worktrees.
+  **On Windows, expect a disk win and a time loss.** Measured on NTFS against
+  a real 404 MB, 22,015-file `node_modules`: each extra worktree costs
+  **6.7 MB instead of 405 MB**, a 60x saving, and husk is ahead from the
+  second worktree onward. But `husk add` took 103s against 37s for
+  worktree+`cp -R` on the same tree, because a hardlink farm pays one syscall
+  per file where a copy streams bytes, and Windows charges more per syscall
+  than per byte. Trade the time if you keep several worktrees alive; do not
+  expect husk to be faster here. One-time `husk adopt` is ~250s on that tree.
+  Timings on Windows are dominated by Defender scanning freshly written
+  files, so a cold run can be 2-3x a warm one; exclude your store directory
+  if you care.
 
 husk never guesses the platform. Every mode is probed against the actual
 filesystems in play, and anything that fails a probe falls off the ladder.
