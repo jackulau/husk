@@ -575,10 +575,16 @@ win_farm() { # src dst -> 0 on success, 1 to fall through to the portable chain
   done
   [ "$n" -ge "$min" ] || return 1
 
-  if [ -z "$HUSK_WINFARM_PS" ]; then
-    HUSK_WINFARM_PS="${TMPDIR:-/tmp}/husk-winfarm.$$.ps1"
-    HUSK_CLEAN_PS="$HUSK_WINFARM_PS"
-    cat > "$HUSK_WINFARM_PS" <<'HUSK_WINFARM_EOF'
+  # Written fresh and deleted at the end of this call, rather than kept for the
+  # life of the process. The prefarm runs hardlink_farm inside a background
+  # subshell, where the EXIT trap does not fire and an assignment to a cleanup
+  # global never reaches the parent that would sweep it, so a memoized script
+  # leaked one file per `husk add`. BASHPID, not $$, for the same reason: in
+  # that subshell $$ is still the parent's pid, and two concurrent farms would
+  # write and delete one path.
+  HUSK_WINFARM_PS="${TMPDIR:-/tmp}/husk-winfarm.${BASHPID:-$$}.ps1"
+  HUSK_CLEAN_PS="$HUSK_WINFARM_PS"
+  cat > "$HUSK_WINFARM_PS" <<'HUSK_WINFARM_EOF'
 param([Parameter(Mandatory=$true)][string]$Src,
       [Parameter(Mandatory=$true)][string]$Dst)
 $ErrorActionPreference = 'Stop'
@@ -637,15 +643,14 @@ try { [HuskFarm]::Farm($Src, $Dst) } catch { exit 1 }
 if ([HuskFarm]::Errors -gt 0) { exit 1 }
 exit 0
 HUSK_WINFARM_EOF
-  fi
 
-  local wsrc wdst wps
-  wsrc=$(cygpath -w "$1") || return 1
-  wdst=$(cygpath -w "$2") || return 1
-  wps=$(cygpath -w "$HUSK_WINFARM_PS") || return 1
-  if powershell -NoProfile -ExecutionPolicy Bypass -File "$wps" -Src "$wsrc" -Dst "$wdst" >/dev/null 2>&1; then
-    return 0
+  local wsrc wdst wps rc=1
+  if wsrc=$(cygpath -w "$1") && wdst=$(cygpath -w "$2") && wps=$(cygpath -w "$HUSK_WINFARM_PS"); then
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$wps" -Src "$wsrc" -Dst "$wdst" >/dev/null 2>&1 && rc=0
   fi
+  rm -f "$HUSK_WINFARM_PS" 2>/dev/null
+  HUSK_WINFARM_PS=""; HUSK_CLEAN_PS=""
+  [ "$rc" = 0 ] && return 0
   rm_rf_safe "$2"
   return 1
 }

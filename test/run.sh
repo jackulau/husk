@@ -340,6 +340,28 @@ assert "doctor --fix removed worktree tmp residue" bash -c "[ ! -d '$TMP/repo/no
 assert "doctor --fix spared live-pid tmp" test -d "$res_store/liveentry.tmp.$$"
 rm -rf "$res_store/liveentry.tmp.$$"
 
+# native Win32 farm: it declines small trees on purpose (PowerShell startup
+# loses to cp -al there), so HUSK_WINFARM_MIN=1 is the only way to make the
+# suite's fixtures exercise it at all. It writes a PowerShell script per call
+# and used to leave one behind on every add, because the prefarm farms inside a
+# background subshell where the EXIT trap never fires.
+if command -v cygpath >/dev/null 2>&1 && command -v powershell >/dev/null 2>&1; then
+  wf_before=$(ls "${TMPDIR:-/tmp}"/husk-winfarm.*.ps1 2>/dev/null | wc -l | tr -d ' ')
+  make_repo "$TMP/wf" "wf-lock-v1"
+  ( cd "$TMP/wf" && HUSK_WINFARM_MIN=1 "$HUSK" adopt >/dev/null 2>&1 )
+  wf_out=$(cd "$TMP/wf" && HUSK_WINFARM_MIN=1 "$HUSK" add "$TMP/wf-wt" wf/1 2>/dev/null)
+  wf_entry=$(printf '%s' "$wf_out" | sed -n 's/.*entry=\([^ ]*\).*/\1/p' | head -1)
+  assert "native Win32 farm provisions a correct tree" test -f "$TMP/wf-wt/node_modules/left-pad/index.js"
+  assert "native Win32 farm shares inodes with the store" \
+    test "$TMP/wf-wt/node_modules/left-pad/index.js" -ef "$wf_entry/left-pad/index.js"
+  wf_after=$(ls "${TMPDIR:-/tmp}"/husk-winfarm.*.ps1 2>/dev/null | wc -l | tr -d ' ')
+  assert "native Win32 farm leaves no script residue" test "$wf_before" -eq "$wf_after"
+else
+  ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
+  ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
+  ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
+fi
+
 # store-inside-repo guard: refuse before any damage can happen
 assert_not "store inside repo is refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link"
 assert "guard names the problem" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link 2>&1 | grep -q 'inside the repo'"
