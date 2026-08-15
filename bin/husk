@@ -971,6 +971,77 @@ cmd_status() {
   fi
 }
 
+# ---------- list (fleet view) ----------
+# status answers "how is THIS worktree wired". With 20-100 worktrees the
+# question is "how is the FLEET wired, and what is the sharing actually
+# buying me". saved_mb is what a copy per worktree would have cost that the
+# store does not: for an entry referenced by R worktrees, (R-1) x its size.
+# Only sharing modes count; a copy-mode dir saves nothing and says so.
+cmd_list() {
+  local root base tmp wt branch sf d key mode entry st cnt size cur live
+  local n_wt=0 n_entries=0 total_saved=0 store_mb=0
+  root=$(repo_root); load_conf "$root"
+  base=$(store_base)
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/husk-list.XXXXXX") || die "mktemp failed"
+  HUSK_CLEAN_TMP="$tmp"
+
+  git worktree list --porcelain 2>/dev/null \
+    | sed -n 's/^worktree //p' | posix_path_stream > "$tmp/wts"
+  while read -r wt; do
+    [ -n "$wt" ] && [ -d "$wt" ] || continue
+    n_wt=$((n_wt + 1))
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    out "wt path=$wt branch=$branch"
+    sf=$(state_file "$wt")
+    [ -f "$sf" ] || continue
+    while IFS=$(printf '\t') read -r d key mode; do
+      [ -n "$d" ] || continue
+      entry=$(entry_path "$d" "$key")
+      st=ok; live=1
+      [ -d "$entry" ] || { st=missing-entry; live=0; }
+      [ -e "$wt/$d" ] || { st=missing-dir; live=0; }
+      if [ "$mode" = "symlink" ] && [ ! -L "$wt/$d" ]; then st=not-a-link; live=0; fi
+      # Drift means the lockfile moved on, not that sharing stopped: the dir is
+      # still linked to the entry, so its bytes still count as saved. Report it,
+      # but keep it a live reference. key_for is empty when the dir has no
+      # fingerprint file, which is not drift either.
+      cur=$(key_for "$wt" "$d" 2>/dev/null || true)
+      [ -z "$cur" ] || [ "$cur" = "$key" ] || st="$st drift=lockfile-changed"
+      out "dep wt=$wt dir=$d mode=$mode key=$key state=$st"
+      # only sharing modes dedupe bytes; a copy-mode dir saves nothing
+      case "$mode" in
+        clone|hardlink|symlink)
+          if [ "$live" -eq 1 ]; then
+            printf '%s\t%s\n' "$key" "$d" >> "$tmp/refs"
+          fi ;;
+      esac
+    done < "$sf"
+  done < "$tmp/wts"
+
+  if [ -f "$tmp/refs" ]; then
+    sort "$tmp/refs" | uniq -c > "$tmp/counts"
+    # 'd' takes the rest of the line, so dep dirs containing spaces survive
+    while read -r cnt key d; do
+      [ -n "$key" ] || continue
+      entry=$(entry_path "$d" "$key")
+      [ -d "$entry" ] || continue
+      size=$(du -sk "$entry" 2>/dev/null | cut -f1)
+      case "$size" in ''|*[!0-9]*) size=0 ;; esac
+      n_entries=$((n_entries + 1))
+      total_saved=$((total_saved + size * (cnt - 1) / 1024))
+      out "entry dir=$d key=$key refs=$cnt size_mb=$((size / 1024)) saved_mb=$((size * (cnt - 1) / 1024))"
+    done < "$tmp/counts"
+  fi
+
+  if [ -d "$base" ]; then
+    store_mb=$(du -sk "$base" 2>/dev/null | cut -f1)
+    case "$store_mb" in ''|*[!0-9]*) store_mb=0 ;; esac
+    store_mb=$((store_mb / 1024))
+  fi
+  out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved"
+  rm -rf "$tmp"; HUSK_CLEAN_TMP=""
+}
+
 # ---------- doctor ----------
 cmd_doctor() {
   local fix=0 root sf d key mode entry issues=0
@@ -1265,7 +1336,8 @@ USAGE
   husk unlink [dir...]                              materialize a private copy, stop sharing
   husk adopt                                        seed the store from this checkout's real dirs
   husk setup [--write]                              adopt + agent instructions (--write appends to AGENTS.md/CLAUDE.md)
-  husk status                                       link states, drift, store size
+  husk status                                       link states, drift, store size (this worktree)
+  husk list                                         every worktree, its deps, and disk saved by sharing
   husk doctor [--fix]                               find/repair dangling links, drift, stale locks
   husk reap [--dry-run] [--days N]                  delete stale worktrees (clean+merged+idle)
   husk gc [--dry-run]                               drop unreferenced store entries
@@ -1284,7 +1356,8 @@ ENV
   HUSK_REAP_DAYS  reap idle threshold (default 7)
   HUSK_DEDUPE     hardlink identical files across store entries at seed time (default 1)
 
-Config file: .husk.conf at repo root (shell syntax: HUSK_DIRS="node_modules .venv" etc.)
+Config file: .husk.conf at repo root. KEY=VALUE lines, parsed and never sourced, so a
+  cloned repo cannot run code on 'husk add'. Example: HUSK_DIRS=node_modules .venv
 Output: stdout is stable key=value lines; humans read stderr.
 Exit codes: 0 ok - 2 needs install - 1 error
 EOF
@@ -1301,6 +1374,7 @@ main() {
     adopt)   cmd_adopt "$@" ;;
     setup)   cmd_setup "$@" ;;
     status)  cmd_status "$@" ;;
+    list)    cmd_list "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     reap)    cmd_reap "$@" ;;
     gc)      cmd_gc "$@" ;;

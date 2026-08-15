@@ -497,6 +497,49 @@ assert "prefarm off: HUSK_PREFARM=0 still provisions" bash -c "
   HUSK_PREFARM=0 '$HUSK' add '$TMP/pre-wt3' feat-off >/dev/null 2>&1 &&
   test -e '$TMP/pre-wt3/node_modules/left-pad/index.js'"
 
+# ================= 19. list: fleet view + savings accounting =================
+# status answers "how is THIS worktree wired"; list has to answer it for the
+# whole fleet and put a number on what the sharing actually bought.
+make_repo "$TMP/lst" "lock-lst"
+cd "$TMP/lst" || exit 1
+dd if=/dev/zero of=node_modules/big.bin bs=1024 count=3072 2>/dev/null  # 3 MB, so saved_mb is not 0
+"$HUSK" link >/dev/null 2>&1
+"$HUSK" add "$TMP/lst-a" feat-a >/dev/null 2>&1
+"$HUSK" add "$TMP/lst-b" feat-b >/dev/null 2>&1
+lst_out=$("$HUSK" list 2>/dev/null)
+assert "list exits 0" bash -c "cd '$TMP/lst' && '$HUSK' list >/dev/null"
+assert "list reports every worktree, not just the current one" \
+  test "$(printf '%s\n' "$lst_out" | grep -c '^wt ')" -eq 3
+assert "list reports a dep line per worktree" \
+  test "$(printf '%s\n' "$lst_out" | grep -c '^dep ')" -eq 3
+assert "list finds all deps healthy" \
+  test "$(printf '%s\n' "$lst_out" | grep -c 'state=ok')" -eq 3
+assert "list collapses the fleet onto one store entry" \
+  bash -c "printf '%s\n' \"\$0\" | grep -q '^entry .*refs=3'" "$lst_out"
+assert "list summary counts the fleet" \
+  bash -c "printf '%s\n' \"\$0\" | grep -q '^summary worktrees=3 entries=1'" "$lst_out"
+# 3 MB shared by 3 worktrees means 2 copies never paid for: saved must be > 0
+lst_saved=$(printf '%s\n' "$lst_out" | sed -n 's/^summary .*saved_mb=\([0-9]*\).*/\1/p')
+assert "list reports nonzero disk saved by sharing" test "${lst_saved:-0}" -gt 0
+assert "saved_mb credits the copies avoided, not the entry itself" test "${lst_saved:-0}" -ge 5
+# a worktree whose lockfile moved on is stale against its store entry; the
+# fleet view is where you would notice, so it has to say so
+cd "$TMP/lst-a" || exit 1
+printf '%s\n' "lock-lst-MOVED" > package-lock.json
+assert "list flags lockfile drift in a worktree" \
+  bash -c "cd '$TMP/lst-a' && '$HUSK' list | grep -q 'drift=lockfile-changed'"
+assert "list still exits 0 when a worktree has drifted" \
+  bash -c "cd '$TMP/lst-a' && '$HUSK' list >/dev/null"
+assert "list leaves no temp dir behind" \
+  bash -c "! ls -d \"\${TMPDIR:-/tmp}\"/husk-list.* 2>/dev/null | grep -q ."
+# a worktree whose dep dir was deleted must be reported, not silently counted
+# as a healthy reference inflating the savings number
+rm -rf "$TMP/lst-b/node_modules"
+assert "list flags a worktree whose dep dir vanished" \
+  bash -c "cd '$TMP/lst' && '$HUSK' list | grep -q 'state=missing-dir'"
+assert "vanished dep drops out of the ref count" \
+  bash -c "cd '$TMP/lst' && '$HUSK' list | grep -q '^entry .*refs=2'"
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

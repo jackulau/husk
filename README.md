@@ -114,7 +114,8 @@ husk link [dir...]           link/provision deps in current worktree
 husk unlink [dir...]         materialize a private copy, stop sharing
 husk adopt                   seed store from this checkout's real dirs
 husk setup [--write]         adopt + agent instructions (--write: append to AGENTS.md once)
-husk status                  link states, lockfile drift, store size
+husk status                  link states, lockfile drift, store size (this worktree)
+husk list                    every worktree, its deps, and disk saved by sharing
 husk doctor [--fix]          detect/repair dangling links, drift, stale locks
 husk reap [--dry-run]        delete stale worktrees (clean + merged/gone + idle 7d)
 husk gc [--dry-run]          drop store entries no worktree references
@@ -236,7 +237,7 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 85 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 105 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck --severity=warning bin/husk install.sh test/run.sh   # must stay clean
 ```
