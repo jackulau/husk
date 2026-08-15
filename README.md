@@ -105,11 +105,14 @@ lockfile versions: the second entry cost 21 MB instead of 395 MB. Reproduce with
 `test/run.sh` plus the commands above.
 
 The table above is the APFS `clone`-mode best case. A second run on NTFS
-`hardlink` mode, against a real 404 MB / 22,015-file `node_modules` with total
+`hardlink` mode, against a real ~400 MB, ~21,000-file `node_modules` with total
 disk remeasured after every single `husk add`, puts the **marginal cost of each
 extra worktree at 6.70 MB against 405.01 MB**, a 60x saving, ahead from the second
 worktree onward. Totals including the store are 5.0x at ten worktrees, because the
 store holds one full copy; quote the marginal number or the total, but say which.
+That 6.70 MB is a whole-volume delta, not `du`: NTFS keeps small directories
+inside the MFT, so `du` over the same pair of trees reports 0.31 MB and is
+wrong about it. The volume delta is the number that describes your disk.
 
 That ratio is not a constant. It is roughly the tree's average bytes per file
 divided by the per-file directory overhead a hardlink farm still pays, about 310
@@ -227,17 +230,29 @@ nothing else is.
   `cp -al` chain. Paths that native `git.exe` emits
   (`C:/...`) are normalized before being hashed or compared, so the store
   namespace is stable across the main checkout and its worktrees.
-  **On Windows, expect a disk win and a time loss.** Measured on NTFS against
-  a real 404 MB, 22,015-file `node_modules`: each extra worktree costs
-  **6.7 MB instead of 405 MB**, a 60x saving, and husk is ahead from the
-  second worktree onward. But `husk add` took 103s against 37s for
-  worktree+`cp -R` on the same tree, because a hardlink farm pays one syscall
-  per file where a copy streams bytes, and Windows charges more per syscall
-  than per byte. Trade the time if you keep several worktrees alive; do not
-  expect husk to be faster here. One-time `husk adopt` is ~250s on that tree.
-  Timings on Windows are dominated by Defender scanning freshly written
-  files, so a cold run can be 2-3x a warm one; exclude your store directory
-  if you care.
+  **On Windows, expect a big disk win and a smaller time loss.** Measured on
+  NTFS against the ~400 MB, ~21,000-file `node_modules` above: each extra
+  worktree costs **6.7 MB instead of 405 MB**, a 60x saving, and husk is ahead
+  on disk from the second worktree onward. On time it is still behind, but by
+  much less than it was: `husk add` is **55.6s against 33.8s** for
+  `git worktree add` + `cp -R`, median of three runs alternated against each
+  other in one session. It used to be 103s against 37s.
+
+  Where the remaining time goes is worth knowing before you read too much into
+  that ratio. A 10-file `node_modules` costs 45-51s on the same box and the
+  21,000-file one costs 55.6s, so almost all of it is **fixed cost, not tree
+  size** — process creation, which MSYS implements with a real Windows process
+  and Defender then inspects. That runs about 1.3s per process here. Cutting
+  the process count and caching what husk kept re-deriving took the fixed part
+  from 149s to under 50s, which is where most of the 103s → 55.6s came from.
+  The work helps on every platform; the size of the win does not transfer,
+  because no other platform charges anything like that per process.
+
+  One-time `husk adopt` is ~250s on that tree. Machine state dominates
+  everything here: one `cp -R` measured minutes after a full test suite came
+  in at 355s against the same command's usual 30s, purely because Defender was
+  still working through what the suite had written. Exclude your store
+  directory if you care about the numbers, and never trust a single timing.
 
 husk never guesses the platform. Every mode is probed against the actual
 filesystems in play, and anything that fails a probe falls off the ladder.
