@@ -1747,7 +1747,7 @@ agent_snippet() {
   cat <<'EOF'
 <!-- husk:agent-instructions -->
 ## Worktrees (husk)
-- Create worktrees with `husk add <path> <branch>` instead of `git worktree add` — dependencies are provisioned instantly from a shared store.
+- Create worktrees with `husk add <path> <branch>` instead of `git worktree add`. Dependencies are provisioned instantly from a shared store.
 - If any husk command exits with code 2, run `husk link --install` inside that worktree.
 - After changing a lockfile and reinstalling deps, run `husk adopt` so sibling worktrees can share the result.
 - Periodically run `husk reap` (removes only clean + merged + idle worktrees) and `husk gc`.
@@ -1793,6 +1793,7 @@ USAGE
   husk reap [--dry-run] [--days N]                  delete stale worktrees (clean+merged+idle)
   husk gc [--dry-run]                               drop unreferenced store entries
   husk dedupe                                       hardlink identical files across store entries
+  husk version                                      print the husk version
 
 MODES (--mode or HUSK_MODE; default: auto)
   auto      probe filesystem: clone > hardlink > symlink
