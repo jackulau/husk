@@ -65,7 +65,7 @@ supports (the **strategy ladder**):
 |---|---|---|---|---|
 | `clone` | copy-on-write clone (APFS, btrfs, XFS) | shared until divergence | full: writes are private | **default on every Mac and CoW Linux** |
 | `hardlink` | hardlink farm | file-level dedupe | near-full | default on ext4 |
-| `symlink` | link into shared store | maximal: one tree, N consumers | none: writes shared (guarded) | opt-in, one-lockfile fleets |
+| `symlink` | link into shared store (a directory junction on Windows) | maximal: one tree, N consumers | none: writes shared (guarded) | opt-in, one-lockfile fleets |
 | `copy` | plain copy | none | full | last-resort fallback, always correct |
 
 `clone` is the sweet spot: ~95% of symlink's storage win, 100% of a real dir's
@@ -104,6 +104,21 @@ time is bounded by git's own worktree lock, not by husk. Store dedupe across two
 lockfile versions: the second entry cost 21 MB instead of 395 MB. Reproduce with
 `test/run.sh` plus the commands above.
 
+The table above is the APFS `clone`-mode best case. A second run on NTFS
+`hardlink` mode, against a real ~400 MB, ~22,000-file `node_modules` with total
+disk remeasured after every single `husk add`, puts the **marginal cost of each
+extra worktree at 6.70 MB against 405.01 MB**, a 60x saving, ahead from the second
+worktree onward. Totals including the store are 5.0x at ten worktrees, because the
+store holds one full copy; quote the marginal number or the total, but say which.
+That 6.70 MB is a whole-volume delta, not `du`: NTFS keeps small directories
+inside the MFT, so `du` over the same pair of trees reports 0.31 MB and is
+wrong about it. The volume delta is the number that describes your disk.
+
+That ratio is not a constant. It is roughly the tree's average bytes per file
+divided by the per-file directory overhead a hardlink farm still pays, about 310
+bytes per file on NTFS. Denser trees do better, and a tree of many tiny files does
+worse. Run `husk list` in your own repo for the number that applies to you.
+
 ## Commands
 
 ```
@@ -114,11 +129,14 @@ husk link [dir...]           link/provision deps in current worktree
 husk unlink [dir...]         materialize a private copy, stop sharing
 husk adopt                   seed store from this checkout's real dirs
 husk setup [--write]         adopt + agent instructions (--write: append to AGENTS.md once)
-husk status                  link states, lockfile drift, store size
+husk status                  link states, lockfile drift, store size (this worktree)
+husk list                    every worktree, its deps, and disk saved by sharing
 husk doctor [--fix]          detect/repair dangling links, drift, stale locks
 husk reap [--dry-run]        delete stale worktrees (clean + merged/gone + idle 7d)
+   --days N                  override the idle threshold for this run
 husk gc [--dry-run]          drop store entries no worktree references
 husk dedupe                  hardlink identical files across store entries
+husk version                 print the husk version
 ```
 
 Machine-readable: stdout is stable `key=value` lines, prose goes to stderr.
@@ -180,7 +198,7 @@ HUSK_MODE=auto                # auto | clone | hardlink | symlink | copy
 HUSK_DIRS="node_modules"      # override auto-detection
 HUSK_REAP_DAYS=7              # reap idle threshold
 HUSK_DEDUPE=1                 # hardlink identical files across store entries at seed time
-HUSK_NUDGE_SECS=3600          # how often 'husk add' probes for stale worktrees
+HUSK_NUDGE_SECS=86400         # how often 'husk add' probes for stale worktrees
 HUSK_LOCK_TIMEOUT=120         # seconds to wait for an orphaned lock
 HUSK_LOCK_TIMEOUT_BUSY=3600   # seconds to wait for a lock whose holder is alive (e.g. an installer)
 ```
@@ -192,6 +210,13 @@ with a warning, `HUSK_MODE` is validated against the mode list, and numeric
 fields must be numeric. A leading `~/` or `$HOME/` in a value is expanded;
 nothing else is.
 
+Three more knobs are environment-only, because they switch off a fast path for
+debugging rather than describe a repo: `HUSK_WINFARM=0` forces the portable
+`cp -al` chain instead of the native Windows hardlink farm, `HUSK_JUNCTION=0`
+refuses directory junctions for `symlink` mode on Windows, and `HUSK_PREFARM=0`
+stops `husk add` from farming the store while git is still checking out. All
+three only change how the same result is reached.
+
 ## Platforms
 
 - **macOS**: primary target. APFS clonefile gives the default `clone` mode.
@@ -200,19 +225,44 @@ nothing else is.
   openssl or sha256sum (all present on any dev box).
 - **Windows (WSL)**: the Linux path above; suite green on Ubuntu 24.04 under
   WSL2.
-- **Windows (native Git Bash)**: supported, suite green (symlink-dependent
-  tests skip honestly). The probe lands on `hardlink` mode — NTFS hardlinks
-  are real. MSYS fakes `ln -s` with a copy unless Developer Mode is on, so
-  the probe never chooses symlink mode by itself, and even a forced
-  `--mode symlink` verifies the link and falls back to `copy` rather than
-  record sharing that isn't happening. Paths that native `git.exe` emits
+- **Windows (native Git Bash)**: supported, suite green. The probe lands on
+  `hardlink` mode, because NTFS hardlinks are real. MSYS fakes `ln -s` with a
+  copy unless Developer Mode is on, so `--mode symlink` uses a **directory
+  junction** instead, which is the one directory link Windows grants an
+  unprivileged user; the link is verified after creation, and anything that
+  isn't a real link falls back to `copy` rather than record sharing that
+  isn't happening. Removing a worktree removes the junction and leaves the
+  store intact (checked against `rm -rf`, `git worktree remove`, and husk's
+  own force-writable delete). Hardlink farming goes through a native
+  `CreateHardLinkW` walk, which avoids MSYS path translation on every one of
+  a `node_modules`' 22,000 files; `HUSK_WINFARM=0` forces the portable
+  `cp -al` chain. Paths that native `git.exe` emits
   (`C:/...`) are normalized before being hashed or compared, so the store
-  namespace is stable across the main checkout and its worktrees. Measured
-  on NTFS (333 MB, 9,800-file `node_modules`): `husk add` 5.7s vs 8.7s for
-  worktree+full-copy, ~2 MB of real disk per extra worktree, and a
-  one-package lockfile bump costs ~3 MB of store after dedupe, not 333 MB.
-  One-time `husk adopt` is ~17s; the very first run can be slower while
-  Windows Defender scans the freshly written files.
+  namespace is stable across the main checkout and its worktrees.
+  **On Windows, expect a big disk win and a smaller time loss.** Measured on
+  NTFS against the ~400 MB, ~22,000-file `node_modules` above: each extra
+  worktree costs **6.7 MB instead of 405 MB**, a 60x saving, and husk is ahead
+  on disk from the second worktree onward. On time it is still behind, but by
+  much less than it was: `husk add` is **55.6s against 33.8s** for
+  `git worktree add` + `cp -R`, median of three runs alternated against each
+  other in one session. It used to be 103s against 37s.
+
+  Where the remaining time goes is worth knowing before you read too much into
+  that ratio. A 10-file `node_modules` costs 45-51s on the same box and the
+  22,000-file one costs 55.6s, so almost all of it is **fixed cost, not tree
+  size**. It is process creation, which MSYS implements with a real Windows
+  process and Defender then inspects. That runs about 1.3s per process here.
+  Cutting the process count and caching what husk kept re-deriving took the
+  fixed part from 149s to under 50s, which is where most of the drop from 103s
+  to 55.6s came from.
+  The work helps on every platform; the size of the win does not transfer,
+  because no other platform charges anything like that per process.
+
+  One-time `husk adopt` is ~250s on that tree. Machine state dominates
+  everything here: one `cp -R` measured minutes after a full test suite came
+  in at 355s against the same command's usual 30s, purely because Defender was
+  still working through what the suite had written. Exclude your store
+  directory if you care about the numbers, and never trust a single timing.
 
 husk never guesses the platform. Every mode is probed against the actual
 filesystems in play, and anything that fails a probe falls off the ladder.
@@ -236,7 +286,7 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 91 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 115 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck --severity=warning bin/husk install.sh test/run.sh   # must stay clean
 ```

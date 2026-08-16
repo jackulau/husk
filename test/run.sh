@@ -30,6 +30,27 @@ trap cleanup EXIT
 HAVE_SYMLINK=0
 ln -s "$TMP" "$TMP/.slprobe" 2>/dev/null && [ -L "$TMP/.slprobe" ] && HAVE_SYMLINK=1
 rm -rf "$TMP/.slprobe"
+# ...but Windows still links DIRECTORIES unprivileged, via a junction, which is
+# what husk's symlink mode uses there. Everything that only needs "the worktree
+# points at the store" tests HAVE_DIRLINK; only the tests that genuinely need
+# `ln -s` itself (store aliases) stay on HAVE_SYMLINK.
+HAVE_DIRLINK=$HAVE_SYMLINK
+if [ "$HAVE_DIRLINK" = 0 ] && command -v cygpath >/dev/null 2>&1 && command -v cmd >/dev/null 2>&1; then
+  mkdir -p "$TMP/.jtgt"
+  cmd //c mklink //J "$(cygpath -w "$TMP/.jprobe")" "$(cygpath -w "$TMP/.jtgt")" >/dev/null 2>&1
+  [ -L "$TMP/.jprobe" ] && [ -d "$TMP/.jprobe" ] && HAVE_DIRLINK=1
+  rm -rf "$TMP/.jprobe" "$TMP/.jtgt"
+fi
+# replace a live link with one pointing nowhere, whichever kind this box makes
+break_link() { # path -> 0 if $1 is now a dangling directory link
+  rm -rf "$1"
+  if ln -s "$TMP/nowhere" "$1" 2>/dev/null && [ -L "$1" ]; then return 0; fi
+  rm -rf "$1"
+  mkdir -p "$TMP/.gone" || return 1
+  cmd //c mklink //J "$(cygpath -w "$1")" "$(cygpath -w "$TMP/.gone")" >/dev/null 2>&1 || return 1
+  rmdir "$TMP/.gone" 2>/dev/null
+  [ -L "$1" ]
+}
 CAN_DIRGUARD=0
 mkdir "$TMP/.gdprobe" && chmod a-w "$TMP/.gdprobe" 2>/dev/null
 touch "$TMP/.gdprobe/x" 2>/dev/null || CAN_DIRGUARD=1
@@ -99,10 +120,13 @@ assert "both store entries coexist" test "$(find "$HUSK_STORE" -mindepth 3 -maxd
 # ================= 5. symlink mode + write guard =================
 make_repo "$TMP/repo2" "slock-v1"
 cd "$TMP/repo2" || exit 1
-if [ "$HAVE_SYMLINK" = 1 ]; then
-  "$HUSK" link --mode symlink >/dev/null 2>&1
-  assert "symlink mode: node_modules is a symlink" test -L "$TMP/repo2/node_modules"
-  assert "symlink resolves into store" bash -c "readlink '$TMP/repo2/node_modules' | grep -q '$HUSK_STORE'"
+if [ "$HAVE_DIRLINK" = 1 ]; then
+  slout=$("$HUSK" link --mode symlink 2>/dev/null)
+  slentry=$(printf '%s' "$slout" | sed -n 's/.*entry=\([^ ]*\).*/\1/p' | head -1)
+  assert "symlink mode: node_modules is a link" test -L "$TMP/repo2/node_modules"
+  # -ef, not a readlink string match: MSYS resolves a junction through its own
+  # mount table, so the same directory reads back under a different spelling
+  assert "symlink resolves to the store entry" test "$TMP/repo2/node_modules" -ef "$slentry"
   if [ "$CAN_DIRGUARD" = 1 ]; then
     assert "write guard: creating file at entry root fails" bash -c "! touch '$TMP/repo2/node_modules/newpkg' 2>/dev/null"
   else
@@ -111,26 +135,26 @@ if [ "$HAVE_SYMLINK" = 1 ]; then
 else
   # fake-symlink platform: forced symlink mode must refuse the fake and
   # fall back to a REAL directory, recording the mode it actually used
-  assert "forced symlink degrades to copy on fake-symlink platforms" \
+  assert "forced symlink degrades to copy where no directory link exists" \
     bash -c "cd '$TMP/repo2' && '$HUSK' link --mode symlink 2>/dev/null | grep -q 'mode=copy'"
-  ok "skip: no real symlinks here (MSYS without symlink privilege)"
-  ok "skip: no real symlinks here (MSYS without symlink privilege)"
+  ok "skip: no directory links here (neither symlink nor junction)"
+  ok "skip: no directory links here (neither symlink nor junction)"
 fi
 
 # ================= 6. doctor detects + fixes dangling links =================
-if [ "$HAVE_SYMLINK" = 1 ]; then
+if [ "$HAVE_DIRLINK" = 1 ]; then
   entry2=$(readlink "$TMP/repo2/node_modules")
   mv "$entry2" "$entry2.hidden"
   assert "doctor detects dangling link" bash -c "cd '$TMP/repo2' && '$HUSK' doctor | grep -q dangling"
   mv "$entry2.hidden" "$entry2"
-  rm "$TMP/repo2/node_modules"; ln -s "$TMP/nowhere" "$TMP/repo2/node_modules"
+  break_link "$TMP/repo2/node_modules"
   cd "$TMP/repo2" || exit 1; "$HUSK" doctor --fix >/dev/null 2>&1 || true
   assert "doctor --fix repaired the link" test -e "$TMP/repo2/node_modules/left-pad/index.js"
   assert "doctor --fix preserved symlink mode" test -L "$TMP/repo2/node_modules"
 else
-  ok "skip: no real symlinks here (dangling-link tests need them)"
-  ok "skip: no real symlinks here (dangling-link tests need them)"
-  ok "skip: no real symlinks here (dangling-link tests need them)"
+  ok "skip: no directory links here (dangling-link tests need them)"
+  ok "skip: no directory links here (dangling-link tests need them)"
+  ok "skip: no directory links here (dangling-link tests need them)"
 fi
 
 # ================= 7. unlink materializes a private copy =================
@@ -316,6 +340,28 @@ assert "doctor --fix removed worktree tmp residue" bash -c "[ ! -d '$TMP/repo/no
 assert "doctor --fix spared live-pid tmp" test -d "$res_store/liveentry.tmp.$$"
 rm -rf "$res_store/liveentry.tmp.$$"
 
+# native Win32 farm: it declines small trees on purpose (PowerShell startup
+# loses to cp -al there), so HUSK_WINFARM_MIN=1 is the only way to make the
+# suite's fixtures exercise it at all. It writes a PowerShell script per call
+# and used to leave one behind on every add, because the prefarm farms inside a
+# background subshell where the EXIT trap never fires.
+if command -v cygpath >/dev/null 2>&1 && command -v powershell >/dev/null 2>&1; then
+  wf_before=$(ls "${TMPDIR:-/tmp}"/husk-winfarm.*.ps1 2>/dev/null | wc -l | tr -d ' ')
+  make_repo "$TMP/wf" "wf-lock-v1"
+  ( cd "$TMP/wf" && HUSK_WINFARM_MIN=1 "$HUSK" adopt >/dev/null 2>&1 )
+  wf_out=$(cd "$TMP/wf" && HUSK_WINFARM_MIN=1 "$HUSK" add "$TMP/wf-wt" wf/1 2>/dev/null)
+  wf_entry=$(printf '%s' "$wf_out" | sed -n 's/.*entry=\([^ ]*\).*/\1/p' | head -1)
+  assert "native Win32 farm provisions a correct tree" test -f "$TMP/wf-wt/node_modules/left-pad/index.js"
+  assert "native Win32 farm shares inodes with the store" \
+    test "$TMP/wf-wt/node_modules/left-pad/index.js" -ef "$wf_entry/left-pad/index.js"
+  wf_after=$(ls "${TMPDIR:-/tmp}"/husk-winfarm.*.ps1 2>/dev/null | wc -l | tr -d ' ')
+  assert "native Win32 farm leaves no script residue" test "$wf_before" -eq "$wf_after"
+else
+  ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
+  ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
+  ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
+fi
+
 # store-inside-repo guard: refuse before any damage can happen
 assert_not "store inside repo is refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link"
 assert "guard names the problem" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link 2>&1 | grep -q 'inside the repo'"
@@ -474,6 +520,20 @@ kA=$(cd "$TMP/un" && PATH="$TMP/us1:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's
 kB=$(cd "$TMP/un" && PATH="$TMP/us2:$PATH" "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
 assert "store key stable across Windows build numbers" test -n "$kA" -a "$kA" = "$kB"
 
+# store key must survive git's line-ending rewriting. core.autocrlf=true is the
+# Git for Windows default, so a lockfile committed with LF lands in a fresh
+# worktree as CRLF: key by raw bytes and husk misses its own store on every add,
+# silently, forever. Same content, two spellings, one key.
+make_repo "$TMP/crlf" "crlf-lock-v1"
+kLF=$(cd "$TMP/crlf" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+printf 'crlf-lock-v1\r\n' > "$TMP/crlf/package-lock.json"
+kCRLF=$(cd "$TMP/crlf" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+assert "store key ignores CRLF vs LF in the lockfile" test -n "$kLF" -a "$kLF" = "$kCRLF"
+# ...but content still keys: a real change must still get its own entry
+printf 'crlf-lock-v2\r\n' > "$TMP/crlf/package-lock.json"
+kV2=$(cd "$TMP/crlf" && "$HUSK" adopt 2>/dev/null | sed -n 's/.*key=\([a-f0-9]*\).*/\1/p' | head -1)
+assert "lockfile content still keys" test -n "$kV2" -a "$kV2" != "$kLF"
+
 # repo_id must not depend on which MSYS mount spelling the cwd used: /tmp and
 # /c/Users/.../Temp are the same dir on native Git Bash, and mixed spellings
 # split the store namespace (adopt seeded one id, add provisioned another)
@@ -507,6 +567,71 @@ if [ "${HUSK_STRESS:-0}" = "1" ]; then
   assert "stress: adopt+dedupe succeed on hostile tree" bash -c "cd '$TMP/stress' && '$HUSK' adopt | grep -q adopted"
   assert "stress: deep leaf survived" bash -c "find \"\$(find '$HUSK_STORE' -type d -name 'n45' | head -1)\" -name leaf.js | grep -q leaf"
 fi
+
+# ================= 18. speculative prefarm (add overlaps checkout) =================
+make_repo "$TMP/pre" "lock-pre"
+cd "$TMP/pre" || exit 1
+"$HUSK" link >/dev/null 2>&1
+"$HUSK" add "$TMP/pre-wt" feat-pre >/dev/null 2>&1
+assert "prefarm: add provisions deps from the stage" test -e "$TMP/pre-wt/node_modules/left-pad/index.js"
+assert_not "prefarm: no staging residue after add" bash -c "ls -d '$TMP'/pre-wt.husk-pre.* 2>/dev/null | grep -q ."
+# a branch whose lockfile diverged from HEAD must never be served the stale
+# stage: link_one re-keys from the real checkout and the stage is discarded
+cd "$TMP/pre" || exit 1
+git checkout -qb feat-newlock
+printf '%s\n' "lock-pre-CHANGED" > package-lock.json
+git add package-lock.json && git commit -qm newlock
+git checkout -q main
+rc_pre=0; "$HUSK" add "$TMP/pre-wt2" feat-newlock >/dev/null 2>&1 || rc_pre=$?
+assert "prefarm discard: diverged lockfile is a store miss (exit 2)" test "$rc_pre" -eq 2
+assert_not "prefarm discard: stale deps NOT provisioned" test -e "$TMP/pre-wt2/node_modules/left-pad/index.js"
+assert_not "prefarm discard: no staging residue" bash -c "ls -d '$TMP'/pre-wt2.husk-pre.* 2>/dev/null | grep -q ."
+assert "prefarm off: HUSK_PREFARM=0 still provisions" bash -c "
+  HUSK_PREFARM=0 '$HUSK' add '$TMP/pre-wt3' feat-off >/dev/null 2>&1 &&
+  test -e '$TMP/pre-wt3/node_modules/left-pad/index.js'"
+
+# ================= 19. list: fleet view + savings accounting =================
+# status answers "how is THIS worktree wired"; list has to answer it for the
+# whole fleet and put a number on what the sharing actually bought.
+make_repo "$TMP/lst" "lock-lst"
+cd "$TMP/lst" || exit 1
+dd if=/dev/zero of=node_modules/big.bin bs=1024 count=3072 2>/dev/null  # 3 MB, so saved_mb is not 0
+"$HUSK" link >/dev/null 2>&1
+"$HUSK" add "$TMP/lst-a" feat-a >/dev/null 2>&1
+"$HUSK" add "$TMP/lst-b" feat-b >/dev/null 2>&1
+lst_out=$("$HUSK" list 2>/dev/null)
+assert "list exits 0" bash -c "cd '$TMP/lst' && '$HUSK' list >/dev/null"
+assert "list reports every worktree, not just the current one" \
+  test "$(printf '%s\n' "$lst_out" | grep -c '^wt ')" -eq 3
+assert "list reports a dep line per worktree" \
+  test "$(printf '%s\n' "$lst_out" | grep -c '^dep ')" -eq 3
+assert "list finds all deps healthy" \
+  test "$(printf '%s\n' "$lst_out" | grep -c 'state=ok')" -eq 3
+assert "list collapses the fleet onto one store entry" \
+  bash -c "printf '%s\n' \"\$0\" | grep -q '^entry .*refs=3'" "$lst_out"
+assert "list summary counts the fleet" \
+  bash -c "printf '%s\n' \"\$0\" | grep -q '^summary worktrees=3 entries=1'" "$lst_out"
+# 3 MB shared by 3 worktrees means 2 copies never paid for: saved must be > 0
+lst_saved=$(printf '%s\n' "$lst_out" | sed -n 's/^summary .*saved_mb=\([0-9]*\).*/\1/p')
+assert "list reports nonzero disk saved by sharing" test "${lst_saved:-0}" -gt 0
+assert "saved_mb credits the copies avoided, not the entry itself" test "${lst_saved:-0}" -ge 5
+# a worktree whose lockfile moved on is stale against its store entry; the
+# fleet view is where you would notice, so it has to say so
+cd "$TMP/lst-a" || exit 1
+printf '%s\n' "lock-lst-MOVED" > package-lock.json
+assert "list flags lockfile drift in a worktree" \
+  bash -c "cd '$TMP/lst-a' && '$HUSK' list | grep -q 'drift=lockfile-changed'"
+assert "list still exits 0 when a worktree has drifted" \
+  bash -c "cd '$TMP/lst-a' && '$HUSK' list >/dev/null"
+assert "list leaves no temp dir behind" \
+  bash -c "! ls -d \"\${TMPDIR:-/tmp}\"/husk-list.* 2>/dev/null | grep -q ."
+# a worktree whose dep dir was deleted must be reported, not silently counted
+# as a healthy reference inflating the savings number
+rm -rf "$TMP/lst-b/node_modules"
+assert "list flags a worktree whose dep dir vanished" \
+  bash -c "cd '$TMP/lst' && '$HUSK' list | grep -q 'state=missing-dir'"
+assert "vanished dep drops out of the ref count" \
+  bash -c "cd '$TMP/lst' && '$HUSK' list | grep -q '^entry .*refs=2'"
 
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

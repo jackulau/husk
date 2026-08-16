@@ -15,6 +15,67 @@ HUSK_LOCK_TIMEOUT="${HUSK_LOCK_TIMEOUT:-120}"
 
 KNOWN_DIRS="node_modules .venv venv target vendor Pods"
 
+# ---------- spawn budget ----------
+# A new process is nearly free on Linux/macOS and brutally expensive here:
+# measured at ~1,275 ms per exec and ~875 ms for a BARE `$(shell_function)` on an
+# NTFS box with Defender inspecting every process creation. MSYS emulates fork
+# with a real Windows process, so command substitution costs almost as much as
+# running an external program. One `husk add` used to pay ~115 of them, which is
+# why a 10-file dependency dir cost 149s and a 21,000-file one cost 162s: the
+# tree was never what we were paying for.
+#
+# Two rules follow, and both are load-bearing:
+#   1. Values that are invariant for the life of the process are computed once.
+#   2. Helpers on the hot path ASSIGN to a global instead of printing, because
+#      `x=$(helper)` forks even when the helper does nothing but expand a string.
+# Every `set_*` below is the assigning form; the printing form is kept beside it
+# where it still has non-hot callers. Behaviour is identical either way.
+HUSK_HAVE_CYGPATH=0
+command -v cygpath >/dev/null 2>&1 && HUSK_HAVE_CYGPATH=1
+HUSK_RCD=""        # repo_common_dir
+HUSK_REPO_ID=""    # repo_id
+HUSK_SB=""         # store_base, guarded by the HUSK_STORE it was built from
+HUSK_SB_FOR=""
+HUSK_RR=""         # repo_root, guarded by the cwd it was resolved from
+HUSK_RR_PWD=""
+HUSK_OS_TAG=""
+HUSK_ARCH=""
+HUSK_SHA_CMD=""    # resolved hasher: shasum -a 256 or sha256sum
+HUSK_DRIVE_SHORTCUT=-1   # -1 untested, 1 shell C:/ -> /c/ agrees with cygpath, 0 it does not
+HUSK_MAIN=""       # main_worktree
+HUSK_EXCLUDED=0    # exclude_husk_dir already ran
+HUSK_CONF_FOR=""   # root that load_conf was last run for
+# scratch outputs of the set_* helpers. Callers must copy to a local before the
+# next set_* of the same name; none of these survive a nested call.
+HUSK_PP=""; HUSK_ABS=""; HUSK_DIRN=""; HUSK_BASE=""
+HUSK_SF=""; HUSK_ENTRY=""; HUSK_KEY=""; HUSK_FP=""; HUSK_PROBE=""; HUSK_CANDS=""
+HUSK_REC=""
+HUSK_DEPDIRS=""
+HUSK_NL='
+'                  # a literal newline, for first-line-of trimming without `head`
+HUSK_TAB='	'      # a literal tab, for splitting state rows without a subshell
+
+dir_of() {  # path -> $HUSK_DIRN. `dirname` without a process.
+  # Trailing-slash inputs are not handled the way dirname handles them; husk
+  # never builds one, and the two spots that could (user-supplied add paths)
+  # go through git or abspath first.
+  case "$1" in
+    */*) HUSK_DIRN=${1%/*}; [ -n "$HUSK_DIRN" ] || HUSK_DIRN=/ ;;
+    *)   HUSK_DIRN=. ;;
+  esac
+}
+
+base_of() { HUSK_BASE=${1##*/}; }   # path -> $HUSK_BASE. `basename` without a process.
+
+HUSK_NOW=0
+now_ts() { # -> $HUSK_NOW, seconds since epoch
+  # Assigns rather than prints on purpose: `n=$(now_ts)` forks a subshell even
+  # when the value comes from a builtin, and the fork is the whole cost being
+  # cut here. bash 3.2 (stock macOS) has no EPOCHSECONDS and still pays `date`.
+  if [ -n "${EPOCHSECONDS:-}" ]; then HUSK_NOW=$EPOCHSECONDS
+  else HUSK_NOW=$(date +%s); fi
+}
+
 # ---------- output conventions ----------
 # stdout: stable key=value lines (machine-readable)
 # stderr: human prose
@@ -24,8 +85,15 @@ out()  { printf '%s\n' "$*"; }
 
 # ---------- portability helpers ----------
 sha256() { # stdin -> hash
-  if command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
-  else sha256sum | cut -d' ' -f1; fi
+  # The `| cut` is gone on purpose: parameter expansion trims the "  -" suffix
+  # for free, where cut costs a process per hash. Same reason the hasher choice
+  # is resolved once instead of on every call.
+  [ -n "$HUSK_SHA_CMD" ] || {
+    if command -v shasum >/dev/null 2>&1; then HUSK_SHA_CMD="shasum -a 256"
+    else HUSK_SHA_CMD="sha256sum"; fi
+  }
+  local o; o=$($HUSK_SHA_CMD)
+  printf '%s' "${o%% *}"
 }
 
 mtime_of() { # file -> epoch seconds
@@ -48,58 +116,171 @@ batch_perms() { # tree -> "PERMS path" lines (batched stat, few forks)
   fi
 }
 
-abspath() { (cd "$1" 2>/dev/null && posix_path "$(pwd -P)"); }
+set_abspath() { # dir -> $HUSK_ABS (empty if the dir does not exist)
+  local p
+  p=$(cd "$1" 2>/dev/null && pwd -P) || { HUSK_ABS=""; return 0; }
+  set_posix_path "$p"; HUSK_ABS=$HUSK_PP
+}
+abspath() { set_abspath "$1"; printf '%s' "$HUSK_ABS"; }
 
-posix_path() { # git.exe on Windows emits C:/-style paths, and MSYS mounts spell
-  # one dir two ways (/tmp vs /c/Users/.../Temp); hashing or comparing mixed
-  # spellings silently splits the store namespace. Canonical form is cygpath -u
-  # of the Windows form, so every absolute path collapses to one spelling.
-  command -v cygpath >/dev/null 2>&1 || { printf '%s' "$1"; return 0; }
+set_posix_path() { # path -> $HUSK_PP
+  # git.exe on Windows emits C:/-style paths, and MSYS mounts spell one dir two
+  # ways (/tmp vs /c/Users/.../Temp); hashing or comparing mixed spellings
+  # silently splits the store namespace. Canonical form is cygpath -u of the
+  # Windows form, so every absolute path collapses to one spelling.
+  if [ "$HUSK_HAVE_CYGPATH" != 1 ]; then HUSK_PP=$1; return 0; fi
+  # Memoized: the /* branch costs TWO cygpath processes, and callers ask about
+  # the same handful of paths repeatedly. The cache stores the key beside the
+  # value and compares it, so two paths whose sanitized names collide take a
+  # miss instead of silently receiving each other's answer.
+  local k ck
+  k="HUSK_PPC_${1//[^a-zA-Z0-9]/_}"
+  eval "ck=\${${k}_K-}"
+  if [ "$ck" = "$1" ]; then eval "HUSK_PP=\${${k}_V}"; return 0; fi
   case "$1" in
-    [A-Za-z]:*) cygpath -u "$1" ;;
-    /*)         cygpath -u "$(cygpath -m "$1")" ;;
-    *)          printf '%s' "$1" ;;
+    [A-Za-z]:*) drive_to_posix "$1" ;;
+    /*)         HUSK_PP=$(cygpath -m "$1"); drive_to_posix "$HUSK_PP" ;;
+    *)          HUSK_PP=$1; return 0 ;;
   esac
+  eval "${k}_K=\$1; ${k}_V=\$HUSK_PP"
+}
+posix_path() { set_posix_path "$1"; printf '%s' "$HUSK_PP"; }
+
+drive_to_posix() { # C:/foo or C:\foo -> /c/foo, in the shell, setting $HUSK_PP
+  # `cygpath -u` costs a process (~1.5s here) for what is a two-character
+  # rewrite under the default MSYS mount table. Rather than assume the table is
+  # default, the first conversion of the process is checked against cygpath; if
+  # they disagree -- a custom /etc/fstab, a UNC path, a substed drive -- the
+  # shell shortcut is switched off for good and every path goes back through
+  # cygpath. One exec to buy certainty, then none.
+  local d=${1%%:*} r=${1#*:} i up=ABCDEFGHIJKLMNOPQRSTUVWXYZ lo=abcdefghijklmnopqrstuvwxyz cg
+  r=${r//\\//}
+  case "$d" in
+    [a-z]) ;;
+    [A-Z]) i=${up%%"$d"*}; d=${lo:${#i}:1} ;;
+    *)     HUSK_PP=$(cygpath -u "$1"); return 0 ;;   # not a plain drive letter
+  esac
+  case "$r" in /*) ;; *) HUSK_PP=$(cygpath -u "$1"); return 0 ;; esac  # C:rel, not absolute
+  if [ "$HUSK_DRIVE_SHORTCUT" = 0 ]; then HUSK_PP=$(cygpath -u "$1"); return 0; fi
+  HUSK_PP="/$d$r"
+  if [ "$HUSK_DRIVE_SHORTCUT" = -1 ]; then
+    cg=$(cygpath -u "$1")
+    if [ "$cg" = "$HUSK_PP" ]; then HUSK_DRIVE_SHORTCUT=1
+    else HUSK_DRIVE_SHORTCUT=0; HUSK_PP=$cg; fi
+  fi
 }
 
 posix_path_stream() { # stdin: one path per line -> POSIX view (no-op off Windows)
-  if command -v cygpath >/dev/null 2>&1; then cygpath -u -f -; else cat; fi
+  if [ "$HUSK_HAVE_CYGPATH" = 1 ]; then cygpath -u -f -; else cat; fi
 }
 
 # ---------- repo context ----------
-repo_root() {
+set_repo_root() { # -> $HUSK_RR
+  # Guarded by cwd: a linked worktree and its main checkout have DIFFERENT roots,
+  # so this may only be reused while the process stays in the same directory.
+  if [ -n "$HUSK_RR" ] && [ "$HUSK_RR_PWD" = "$PWD" ]; then return 0; fi
   local r; r=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
-  posix_path "$r"
+  set_posix_path "$r"; HUSK_RR=$HUSK_PP; HUSK_RR_PWD=$PWD
 }
+repo_root() { set_repo_root; printf '%s' "$HUSK_RR"; }
 
-repo_common_dir() {
-  local c; c=$(git rev-parse --git-common-dir)
-  c=$(posix_path "$c")
-  case "$c" in /*) ;; *) c="$(pwd)/$c" ;; esac
-  abspath "$c"
+set_repo_common_dir() { # -> $HUSK_RCD
+  # Unguarded on purpose: --git-common-dir is the SAME directory whether you ask
+  # from the main checkout or any of its linked worktrees. That invariance is
+  # exactly what makes one store namespace serve a repo and all its worktrees,
+  # so a single resolution is valid for the whole process.
+  [ -z "$HUSK_RCD" ] || return 0
+  local c=""
+  # Derive it from the checkout before paying `git rev-parse` a process. The
+  # layout is fixed: a main checkout has .git as a directory, a linked worktree
+  # has .git as a file reading "gitdir: <common>/worktrees/<name>". Anything the
+  # derivation cannot confirm -- an env override, a relative gitdir, a bare or
+  # unusual repo -- falls through to git, which is always authoritative.
+  if [ -z "${GIT_DIR:-}" ] && [ -z "${GIT_COMMON_DIR:-}" ]; then
+    set_repo_root
+    if [ -d "$HUSK_RR/.git" ]; then
+      c="$HUSK_RR/.git"
+    elif [ -f "$HUSK_RR/.git" ]; then
+      local gd; read -r _ gd < "$HUSK_RR/.git" 2>/dev/null || gd=""
+      case "$gd" in
+        /*|[A-Za-z]:*) case "$gd" in */worktrees/*) c="${gd%/worktrees/*}" ;; esac ;;
+      esac
+    fi
+    # confirm the guess actually IS a git dir before trusting it
+    [ -n "$c" ] && [ -f "$c/config" ] || c=""
+  fi
+  [ -n "$c" ] || c=$(git rev-parse --git-common-dir)
+  set_posix_path "$c"; c=$HUSK_PP
+  case "$c" in /*) ;; *) c="$PWD/$c" ;; esac
+  set_abspath "$c"; HUSK_RCD=$HUSK_ABS
 }
+repo_common_dir() { set_repo_common_dir; printf '%s' "$HUSK_RCD"; }
 
-repo_id() { printf '%s' "$(repo_common_dir)" | sha256 | cut -c1-12; }
+set_repo_id() { # -> $HUSK_REPO_ID
+  [ -z "$HUSK_REPO_ID" ] || return 0
+  set_repo_common_dir
+  # Cached in the git common dir, because hashing costs a pipeline (~5s here)
+  # and the answer is a pure function of a path that cannot change while the
+  # cache file sits inside it. The path is stored beside the id and compared:
+  # move the repo and the id must change, so a stale line is ignored, not used.
+  local cf="$HUSK_RCD/husk-repo-id" cid cpath h
+  if [ -f "$cf" ]; then
+    IFS=$HUSK_TAB read -r cid cpath < "$cf" 2>/dev/null || true
+    if [ -n "$cid" ] && [ "$cpath" = "$HUSK_RCD" ]; then HUSK_REPO_ID=$cid; return 0; fi
+  fi
+  h=$(printf '%s' "$HUSK_RCD" | sha256)
+  HUSK_REPO_ID=${h:0:12}
+  printf '%s\t%s\n' "$HUSK_REPO_ID" "$HUSK_RCD" > "$cf" 2>/dev/null || true
+}
+repo_id() { set_repo_id; printf '%s' "$HUSK_REPO_ID"; }
 
-main_worktree() { git worktree list --porcelain | head -1 | sed 's/^worktree //' | posix_path_stream; }
+set_main_worktree() { # -> $HUSK_MAIN
+  # `git worktree list` always prints the main checkout first, and that answer
+  # cannot change while one husk process runs -- `husk add` creates a LINKED
+  # worktree, never a new main. Was four processes (git|head|sed|cygpath) per
+  # call; now one, once.
+  [ -z "$HUSK_MAIN" ] || return 0
+  local o; o=$(git worktree list --porcelain)
+  o=${o%%"$HUSK_NL"*}
+  set_posix_path "${o#worktree }"; HUSK_MAIN=$HUSK_PP
+}
+main_worktree() { set_main_worktree; printf '%s' "$HUSK_MAIN"; }
 
 exclude_husk_dir() { # keep .husk/ out of git status without touching the repo
-  local ex; ex=$(git rev-parse --git-path info/exclude 2>/dev/null) || return 0
-  mkdir -p "$(dirname "$ex")"
-  grep -qx '\.husk/' "$ex" 2>/dev/null || printf '.husk/\n' >> "$ex"
+  # Idempotent, so the second and later callers in one process are a no-op.
+  # info/exclude lives in the COMMON dir (it is shared by every worktree), which
+  # husk already knows, so this costs no processes at all: no `git rev-parse
+  # --git-path`, and the membership test is a read loop rather than a grep.
+  if [ "$HUSK_EXCLUDED" = 1 ]; then return 0; fi
+  set_repo_common_dir
+  local ex="$HUSK_RCD/info/exclude" line
+  [ -n "$HUSK_RCD" ] || return 0
+  if [ -f "$ex" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      if [ "$line" = ".husk/" ]; then HUSK_EXCLUDED=1; return 0; fi
+    done < "$ex"
+  else
+    mkdir -p "$HUSK_RCD/info" 2>/dev/null || return 0
+  fi
+  printf '.husk/\n' >> "$ex" 2>/dev/null || true
+  HUSK_EXCLUDED=1
 }
 
 # ---------- config ----------
 load_conf() { # .husk.conf at repo root: KEY=VALUE lines, parsed - NEVER sourced.
   # Agents run husk inside freshly cloned repos (AGENTS.md tells them to);
   # sourcing would hand any repository arbitrary code execution on 'husk add'.
+  # Idempotent for a given root, and every command calls it at least once while
+  # cmd_add calls it twice. Re-running it re-parses the file and re-pays
+  # store_guard's three processes for a result that cannot have changed.
+  if [ "$HUSK_CONF_FOR" = "$1" ]; then return 0; fi
   local root="$1" f="$1/.husk.conf" line k v
   if [ -f "$f" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       case "$line" in \#*|"") continue ;; esac
       line=${line#export }                    # tolerate old shell-style files
       k=${line%%=*}; v=${line#*=}
-      k=$(printf '%s' "$k" | tr -d ' \t')
+      k=${k// /}; k=${k//"$HUSK_TAB"/}         # was: printf | tr -d, two processes per line
       case "$v" in \"*\") v=${v%\"}; v=${v#\"} ;; \'*\') v=${v%\'}; v=${v#\'} ;; esac
       # shellcheck disable=SC2088  # matching a LITERAL ~/ in the conf value is the point
       case "$v" in "~/"*) v="$HOME/${v#"~/"}" ;; '$HOME/'*) v="$HOME/${v#'$HOME/'}" ;; esac
@@ -121,6 +302,7 @@ load_conf() { # .husk.conf at repo root: KEY=VALUE lines, parsed - NEVER sourced
     done < "$f"
   fi
   store_guard "$root"
+  HUSK_CONF_FOR="$1"
 }
 
 store_guard() { # root -> refuse a store inside the repo: 'git worktree remove',
@@ -131,7 +313,7 @@ store_guard() { # root -> refuse a store inside the repo: 'git worktree remove',
   # resolve through the nearest existing ancestor: the store may not exist yet,
   # and /var -> /private/var style symlinks would otherwise dodge the comparison
   d="$sb"
-  while [ ! -d "$d" ] && [ "$d" != "/" ]; do d=$(dirname "$d"); done
+  while [ ! -d "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do dir_of "$d"; d=$HUSK_DIRN; done
   sb="$(cd "$d" && pwd -P)${sb#"$d"}"
   root=$(cd "$root" 2>/dev/null && pwd -P) || return 0
   case "$sb" in
@@ -140,69 +322,117 @@ store_guard() { # root -> refuse a store inside the repo: 'git worktree remove',
 }
 
 # ---------- lockfile mapping ----------
-lockfile_candidates() { # dep dir name -> ordered lockfile candidates
+# These set a variable rather than echo, because `for f in $(candidates "$d")`
+# forked a subshell for what is a pure case statement.
+set_lockfile_candidates() { # dep dir name -> $HUSK_CANDS, ordered lockfile candidates
   case "$1" in
-    node_modules) echo "package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lockb bun.lock" ;;
-    .venv|venv)   echo "uv.lock poetry.lock Pipfile.lock requirements.txt" ;;
-    target)       echo "Cargo.lock" ;;
-    vendor)       echo "Gemfile.lock composer.lock go.sum" ;;
-    Pods)         echo "Podfile.lock" ;;
-    *)            echo "" ;;
+    node_modules) HUSK_CANDS="package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock bun.lockb bun.lock" ;;
+    .venv|venv)   HUSK_CANDS="uv.lock poetry.lock Pipfile.lock requirements.txt" ;;
+    target)       HUSK_CANDS="Cargo.lock" ;;
+    vendor)       HUSK_CANDS="Gemfile.lock composer.lock go.sum" ;;
+    Pods)         HUSK_CANDS="Podfile.lock" ;;
+    *)            HUSK_CANDS="" ;;
   esac
 }
 
-manifest_candidates() { # fallback when no lockfile exists
+set_manifest_candidates() { # fallback when no lockfile exists
   case "$1" in
-    node_modules) echo "package.json" ;;
-    .venv|venv)   echo "pyproject.toml setup.py" ;;
-    target)       echo "Cargo.toml" ;;
-    vendor)       echo "Gemfile composer.json go.mod" ;;
-    Pods)         echo "Podfile" ;;
-    *)            echo "" ;;
+    node_modules) HUSK_CANDS="package.json" ;;
+    .venv|venv)   HUSK_CANDS="pyproject.toml setup.py" ;;
+    target)       HUSK_CANDS="Cargo.toml" ;;
+    vendor)       HUSK_CANDS="Gemfile composer.json go.mod" ;;
+    Pods)         HUSK_CANDS="Podfile" ;;
+    *)            HUSK_CANDS="" ;;
   esac
 }
 
-find_fingerprint_file() { # root dir -> path of first existing lockfile (or manifest), empty if none
-  local root="$1" dir="$2" f
-  for f in $(lockfile_candidates "$dir"); do
-    [ -f "$root/$f" ] && { printf '%s' "$root/$f"; return 0; }
+set_fingerprint_file() { # root dir -> $HUSK_FP, first existing lockfile (or manifest), empty if none
+  local root="$1" f
+  set_lockfile_candidates "$2"
+  for f in $HUSK_CANDS; do
+    if [ -f "$root/$f" ]; then HUSK_FP="$root/$f"; return 0; fi
   done
-  for f in $(manifest_candidates "$dir"); do
-    [ -f "$root/$f" ] && { printf '%s' "$root/$f"; return 0; }
+  set_manifest_candidates "$2"
+  for f in $HUSK_CANDS; do
+    if [ -f "$root/$f" ]; then HUSK_FP="$root/$f"; return 0; fi
   done
-  printf ''
+  HUSK_FP=""
 }
+find_fingerprint_file() { set_fingerprint_file "$1" "$2"; printf '%s' "$HUSK_FP"; }
 
-os_tag() { # stable OS identity for store keys. MSYS bakes the Windows build
+set_os_tag() { # stable OS identity for store keys. MSYS bakes the Windows build
   # into 'uname -s' (MINGW64_NT-10.0-26200): left raw, every Windows update
   # would silently re-key the whole store and force a full reseed.
+  [ -z "$HUSK_OS_TAG" ] || return 0
   local s; s=$(uname -s)
   case "$s" in MINGW*_NT*|MSYS_NT*|CYGWIN_NT*) s="${s%%-*}" ;; esac
-  printf '%s' "$s"
+  HUSK_OS_TAG=$s
 }
 
-key_for() { # root dir -> content key (or empty if unfingerprintable)
-  local root="$1" dir="$2" fp
-  fp=$(find_fingerprint_file "$root" "$dir")
-  [ -n "$fp" ] || { printf ''; return 0; }
-  { printf '%s\n%s-%s\n' "$dir" "$(os_tag)" "$(uname -m)"; cat "$fp"; } | sha256 | cut -c1-16
+set_arch_tag() { # machine arch, resolved once per process
+  [ -z "$HUSK_ARCH" ] || return 0
+  HUSK_ARCH=$(uname -m)
 }
 
-detect_dirs() { # root -> dep dirs relevant to this repo (exists OR its lockfile exists)
+set_key_for() { # root dir -> $HUSK_KEY, content key (empty if unfingerprintable)
+  local fp h
+  # cleared up front: callers that tolerate failure (`set_key_for ... || true`)
+  # would otherwise read the PREVIOUS dir's key out of the global and compare it
+  # against this dir's recorded one.
+  HUSK_KEY=""
+  set_fingerprint_file "$1" "$2"; fp=$HUSK_FP
+  [ -n "$fp" ] || { HUSK_KEY=""; return 0; }
+  set_os_tag; set_arch_tag
+  # Line endings are stripped out of the key, because git puts them back
+  # differently in different checkouts. With core.autocrlf=true -- the Git for
+  # Windows default -- a lockfile committed with LF arrives in a fresh worktree
+  # as CRLF, so the same dependency tree fingerprints differently in the main
+  # checkout and in every worktree made from it, and husk misses its own store
+  # on every single `husk add`. Nothing breaks loudly; sharing just silently
+  # never happens, which is the worst failure this tool has.
+  #
+  # Safe because a lockfile's meaning does not depend on its line endings: two
+  # files that differ only there describe the same tree, so sharing between
+  # them is correct. bun.lockb is the one binary candidate and is hashed raw,
+  # where a stray 0x0d is data, not a line ending.
+  #
+  # This costs no extra process: `tr` replaces the `cat` that was already here.
+  base_of "$fp"
+  case "$HUSK_BASE" in
+    *.lockb) h=$({ printf '%s\n%s-%s\n' "$2" "$HUSK_OS_TAG" "$HUSK_ARCH"; cat "$fp"; } | sha256) ;;
+    *)       h=$({ printf '%s\n%s-%s\n' "$2" "$HUSK_OS_TAG" "$HUSK_ARCH"; tr -d '\r' < "$fp"; } | sha256) ;;
+  esac
+  HUSK_KEY=${h:0:16}
+}
+key_for() { set_key_for "$1" "$2"; printf '%s' "$HUSK_KEY"; }
+
+set_detect_dirs() { # root -> $HUSK_DEPDIRS, dep dirs relevant to this repo
   local root="$1" d found=""
-  if [ -n "${HUSK_DIRS:-}" ]; then printf '%s' "$HUSK_DIRS"; return 0; fi
+  if [ -n "${HUSK_DIRS:-}" ]; then HUSK_DEPDIRS=$HUSK_DIRS; return 0; fi
   for d in $KNOWN_DIRS; do
     # claim the dir if it exists, or a lockfile/manifest maps to it
-    if [ -e "$root/$d" ] || [ -n "$(find_fingerprint_file "$root" "$d")" ]; then
+    set_fingerprint_file "$root" "$d"
+    if [ -e "$root/$d" ] || [ -n "$HUSK_FP" ]; then
       found="$found $d"
     fi
   done
-  printf '%s' "$found"
+  HUSK_DEPDIRS=$found
 }
+detect_dirs() { set_detect_dirs "$1"; printf '%s' "$HUSK_DEPDIRS"; }
 
 # ---------- store ----------
-store_base() { printf '%s/%s' "$HUSK_STORE" "$(repo_id)"; }
-entry_path() { printf '%s/%s/%s' "$(store_base)" "$1" "$2"; }  # dir key
+set_store_base() { # -> $HUSK_SB
+  # Guarded by HUSK_STORE: load_conf can change it after the first call, and the
+  # tests set it per case. The guard makes the cache follow the variable instead
+  # of freezing whichever store happened to be first.
+  if [ -n "$HUSK_SB" ] && [ "$HUSK_SB_FOR" = "$HUSK_STORE" ]; then return 0; fi
+  set_repo_id
+  HUSK_SB="$HUSK_STORE/$HUSK_REPO_ID"; HUSK_SB_FOR="$HUSK_STORE"
+}
+store_base() { set_store_base; printf '%s' "$HUSK_SB"; }
+
+set_entry_path() { set_store_base; HUSK_ENTRY="$HUSK_SB/$1/$2"; }   # dir key -> $HUSK_ENTRY
+entry_path() { set_entry_path "$1" "$2"; printf '%s' "$HUSK_ENTRY"; }
 
 # ---------- locking (portable: no flock on macOS) ----------
 steal_lock() { # lockdir expected-dead-pid -> 0 stolen, 1 lost the race
@@ -256,7 +486,8 @@ acquire_lock() { # lockdir
     fi
     if [ -z "$pid" ]; then
       # holder died between mkdir and writing its pid; steal once it's old
-      age=$(( $(date +%s) - $(mtime_of "$lock" 2>/dev/null || date +%s) ))
+      now_ts
+      age=$(( HUSK_NOW - $(mtime_of "$lock" 2>/dev/null || printf '%s' "$HUSK_NOW") ))
       if [ "$age" -gt 30 ]; then
         note "stealing pid-less lock (${age}s old): $lock"
         steal_lock "$lock" "" || true
@@ -282,11 +513,22 @@ release_lock() { rm -rf "$1"; HUSK_CLEAN_LOCK=""; }
 # trap sweeps whatever is still marked. rm_rf_safe is defined just below.
 HUSK_CLEAN_LOCK=""
 HUSK_CLEAN_TMP=""
+HUSK_PREFARM_TMP=""
+HUSK_PREFARM_PID=""
+HUSK_WINFARM_PS=""
+HUSK_CLEAN_PS=""
 PROBE_CACHE_KEY=""
 PROBE_CACHE_VAL=""
 husk_cleanup() {
   [ -n "$HUSK_CLEAN_TMP" ] && rm_rf_safe "$HUSK_CLEAN_TMP" 2>/dev/null
   [ -n "$HUSK_CLEAN_LOCK" ] && rm -rf "$HUSK_CLEAN_LOCK" 2>/dev/null
+  [ -n "$HUSK_CLEAN_PS" ] && rm -f "$HUSK_CLEAN_PS" 2>/dev/null
+  if [ -n "$HUSK_PREFARM_TMP" ]; then
+    [ -n "$HUSK_PREFARM_PID" ] && kill "$HUSK_PREFARM_PID" 2>/dev/null
+    wait 2>/dev/null || true
+    rm_rf_safe "$HUSK_PREFARM_TMP" 2>/dev/null
+    rm -f "$HUSK_PREFARM_TMP.done" "$HUSK_PREFARM_TMP.failed" 2>/dev/null
+  fi
   return 0
 }
 trap husk_cleanup EXIT
@@ -327,7 +569,115 @@ cow_clone() { # src dst -> 0 if CoW clone succeeded; never leaves a partial dst
   return 1                  # modes, possibly read-only); residue would jam every fallback
 }
 
+win_farm() { # src dst -> 0 on success, 1 to fall through to the portable chain
+  # MSYS `cp -al` pays POSIX emulation and path translation on every one of a
+  # node_modules' ~21,000 files. A native CreateHardLinkW walk pays neither:
+  # measured 17.8s against cp -al's 25.3s and perl's 22.6s on the same tree,
+  # all three producing identical trees with shared inodes.
+  #
+  # Strictly first-choice-with-fallback: any failure here (no powershell, no
+  # C# compiler, a reparse point, one failed link) returns 1 and hardlink_farm
+  # continues down the chain it always used, so this Windows-only branch can
+  # rot without ever becoming a correctness risk.
+  [ "$HUSK_HAVE_CYGPATH" = 1 ] || return 1
+  [ "${HUSK_WINFARM:-1}" = "1" ] || return 1
+  command -v powershell >/dev/null 2>&1 || return 1
+
+  # Size gate, paid for with a glob instead of a walk. PowerShell startup plus
+  # the Add-Type compile costs a couple of seconds flat, which LOSES to cp -al
+  # on a small tree -- but counting the tree to find out would cost more than
+  # the decision saves. Top-level children stand in for size: a real
+  # node_modules has hundreds of package directories, a fixture has three.
+  local min="${HUSK_WINFARM_MIN:-64}" n=0 f
+  for f in "$1"/*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    n=$((n+1))
+    [ "$n" -ge "$min" ] && break
+  done
+  [ "$n" -ge "$min" ] || return 1
+
+  # Written fresh and deleted at the end of this call, rather than kept for the
+  # life of the process. The prefarm runs hardlink_farm inside a background
+  # subshell, where the EXIT trap does not fire and an assignment to a cleanup
+  # global never reaches the parent that would sweep it, so a memoized script
+  # leaked one file per `husk add`. BASHPID, not $$, for the same reason: in
+  # that subshell $$ is still the parent's pid, and two concurrent farms would
+  # write and delete one path.
+  HUSK_WINFARM_PS="${TMPDIR:-/tmp}/husk-winfarm.${BASHPID:-$$}.ps1"
+  HUSK_CLEAN_PS="$HUSK_WINFARM_PS"
+  cat > "$HUSK_WINFARM_PS" <<'HUSK_WINFARM_EOF'
+param([Parameter(Mandatory=$true)][string]$Src,
+      [Parameter(Mandatory=$true)][string]$Dst)
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public static class HuskFarm {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool CreateHardLinkW(string lpFileName, string lpExistingFileName, IntPtr lpSecurityAttributes);
+
+    public static int Errors = 0;
+    public static int Files = 0;
+
+    // node_modules nests past MAX_PATH; the \\?\ prefix is the only form
+    // CreateHardLinkW accepts for those.
+    static string Ext(string p) {
+        if (p.StartsWith(@"\\?\")) return p;
+        if (p.StartsWith(@"\\")) return @"\\?\UNC\" + p.Substring(2);
+        return @"\\?\" + p;
+    }
+
+    public static void Farm(string src, string dst) {
+        src = Path.GetFullPath(src);
+        dst = Path.GetFullPath(dst);
+        Directory.CreateDirectory(Ext(dst));
+        Walk(src, dst);
+    }
+
+    static void Walk(string src, string dst) {
+        foreach (string d in Directory.EnumerateDirectories(Ext(src))) {
+            string name = Path.GetFileName(d);
+            // A junction or symlink is not a directory to descend into, and
+            // this walker cannot reproduce one. Hand the tree back instead.
+            FileAttributes a = File.GetAttributes(Ext(d));
+            if ((a & FileAttributes.ReparsePoint) != 0) { Errors++; return; }
+            string target = Path.Combine(dst, name);
+            Directory.CreateDirectory(Ext(target));
+            Walk(Path.Combine(src, name), target);
+            if (Errors > 0) return;
+        }
+        foreach (string f in Directory.EnumerateFiles(Ext(src))) {
+            string name = Path.GetFileName(f);
+            if (!CreateHardLinkW(Ext(Path.Combine(dst, name)), Ext(Path.Combine(src, name)), IntPtr.Zero)) {
+                Errors++;
+                return;   // bail on first failure; the caller discards the partial tree
+            }
+            Files++;
+        }
+    }
+}
+'@
+try { [HuskFarm]::Farm($Src, $Dst) } catch { exit 1 }
+if ([HuskFarm]::Errors -gt 0) { exit 1 }
+exit 0
+HUSK_WINFARM_EOF
+
+  local wsrc wdst wps rc=1
+  if wsrc=$(cygpath -w "$1") && wdst=$(cygpath -w "$2") && wps=$(cygpath -w "$HUSK_WINFARM_PS"); then
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$wps" -Src "$wsrc" -Dst "$wdst" >/dev/null 2>&1 && rc=0
+  fi
+  rm -f "$HUSK_WINFARM_PS" 2>/dev/null
+  HUSK_WINFARM_PS=""; HUSK_CLEAN_PS=""
+  [ "$rc" = 0 ] && return 0
+  rm_rf_safe "$2"
+  return 1
+}
+
 hardlink_farm() { # src dst -> 0 on success; never leaves a partial dst
+  if win_farm "$1" "$2"; then return 0; fi                      # native Win32
   if cp -al "$1" "$2" 2>/dev/null; then return 0; fi            # GNU cp
   rm_rf_safe "$2"
   if command -v perl >/dev/null 2>&1; then
@@ -357,6 +707,28 @@ hardlink_farm() { # src dst -> 0 on success; never leaves a partial dst
   return 1
 }
 
+make_junction() { # link entry -> 0 if a real directory junction now exists at $1
+  # Windows has three ways to point one directory at another and only one of
+  # them works unprivileged: a junction. MSYS `ln -s` without Developer Mode
+  # silently makes a COPY, which is why forced symlink mode used to degrade all
+  # the way to copy here and quietly stop sharing anything.
+  #
+  # Verified against every deletion path husk uses (rm -rf, mv + rm -rf, git
+  # worktree remove, and rm_rf_safe's chmod -R u+w + rm -rf): each removes the
+  # link and leaves the store target intact. MSYS also reports a junction as -L
+  # with a working readlink, so every check downstream that already handled a
+  # symlink handles this one unchanged.
+  [ "$HUSK_HAVE_CYGPATH" = 1 ] || return 1
+  [ "${HUSK_JUNCTION:-1}" = "1" ] || return 1
+  command -v cmd >/dev/null 2>&1 || return 1
+  local wl we
+  wl=$(cygpath -w "$1") || return 1
+  we=$(cygpath -w "$2") || return 1
+  cmd //c mklink //J "$wl" "$we" >/dev/null 2>&1 || return 1
+  # trust nothing: a junction that did not actually resolve is worse than none
+  [ -L "$1" ] && [ -d "$1" ]
+}
+
 plain_copy() { # src dst -> dst must not pre-exist (partial dst is removed, see cow_clone)
   if [ -d "$1" ] && par_fanout "$1" "$2" copy; then return 0; fi
   rm_rf_safe "$2"
@@ -364,40 +736,93 @@ plain_copy() { # src dst -> dst must not pre-exist (partial dst is removed, see 
   chmod u+w "$2" 2>/dev/null || true   # source root may be write-guarded; a copy is private
 }
 
-probe_mode() { # decide best mode: store entry -> worktree target fs
+set_probe_mode() { # storefs wtfs -> $HUSK_PROBE, the best mode between them
   local storefs="$1" wtfs="$2"
   # pid-unique names: a shared probe file lets two concurrent probes delete
   # each other's file mid-ladder and silently downgrade both to copy mode
   local probe="$storefs/.husk-probe.$$" t="$wtfs/.husk-probe.$$"
-  [ "$HUSK_MODE" != "auto" ] && { printf '%s' "$HUSK_MODE"; return 0; }
+  if [ "$HUSK_MODE" != "auto" ]; then HUSK_PROBE=$HUSK_MODE; return 0; fi
+
+  # Disk cache. Walking the ladder costs three exec'd copy attempts (~12s on
+  # Windows) to re-derive a fact about two filesystems that does not change
+  # between runs. Keyed on the store plus the worktree's PARENT, because the
+  # worktree itself is new on every `husk add` while its parent is where the
+  # whole fleet lives.
+  #
+  # Only a SHARING answer is ever written. That asymmetry is the safety
+  # property: a stale entry can only claim MORE sharing than the filesystems
+  # now support, and provision() already catches that and falls back to copy,
+  # loudly. A stale "copy" would silently stop sharing forever, so "copy" is
+  # never cached and gets re-probed every time.
+  local ck cf cmode ckey
+  dir_of "$wtfs"; ck="$storefs|$HUSK_DIRN"
+  if [ "${HUSK_PROBE_CACHE:-1}" = "1" ]; then
+    set_repo_common_dir; cf="$HUSK_RCD/husk-probe-cache"
+    if [ -f "$cf" ]; then
+      while IFS=$HUSK_TAB read -r cmode ckey; do
+        if [ "$ckey" = "$ck" ]; then HUSK_PROBE=$cmode; return 0; fi
+      done < "$cf"
+    fi
+  else
+    cf=""
+  fi
+
   mkdir -p "$storefs" "$wtfs"
   echo probe > "$probe"
-  if cow_clone "$probe" "$t"; then rm -f "$t" "$probe"; printf 'clone'; return 0; fi
-  if ln "$probe" "$t" 2>/dev/null; then rm -f "$t" "$probe"; printf 'hardlink'; return 0; fi
+  if cow_clone "$probe" "$t"; then rm -f "$t" "$probe"; HUSK_PROBE=clone; probe_cache_put "$cf" "$ck"; return 0; fi
+  if ln "$probe" "$t" 2>/dev/null; then rm -f "$t" "$probe"; HUSK_PROBE=hardlink; probe_cache_put "$cf" "$ck"; return 0; fi
   # verify symlinks are REAL here: MSYS/Git Bash "ln -s" silently copies unless
   # symlink privilege is enabled, which would fake sharing while eating full disk
   if ln -s "$probe" "$t" 2>/dev/null && [ -L "$t" ]; then
-    rm -f "$t" "$probe"; printf 'symlink'; return 0
+    rm -f "$t" "$probe"; HUSK_PROBE=symlink; probe_cache_put "$cf" "$ck"; return 0
+  fi
+  rm -f "$t"
+  # Windows: no symlink privilege, but a junction links directories anyway.
+  # Probed with a directory because that is all a junction can point at, and
+  # all husk ever points at.
+  if mkdir -p "$storefs/.husk-jprobe.$$" 2>/dev/null; then
+    if make_junction "$t" "$storefs/.husk-jprobe.$$"; then
+      rm -f "$t"; rmdir "$storefs/.husk-jprobe.$$" 2>/dev/null
+      rm -f "$probe"; HUSK_PROBE=symlink; probe_cache_put "$cf" "$ck"; return 0
+    fi
+    rm -f "$t" 2>/dev/null; rm -rf "$t" 2>/dev/null
+    rmdir "$storefs/.husk-jprobe.$$" 2>/dev/null
   fi
   rm -f "$t" "$probe"
-  printf 'copy'
+  HUSK_PROBE=copy
 }
+
+probe_cache_put() { # cachefile key -> record $HUSK_PROBE for this filesystem pair
+  # A short append, so concurrent writers interleave whole lines rather than
+  # tearing one; a duplicate line is harmless because the first match wins.
+  [ -n "$1" ] || return 0
+  printf '%s\t%s\n' "$HUSK_PROBE" "$2" >> "$1" 2>/dev/null || true
+}
+probe_mode() { set_probe_mode "$1" "$2"; printf '%s' "$HUSK_PROBE"; }
 
 # ---------- worktree state (.husk/state: dir<TAB>key<TAB>mode) ----------
+set_state_file() { HUSK_SF="$1/.husk/state"; }   # root -> $HUSK_SF
 state_file() { printf '%s/.husk/state' "$1"; }
 
-state_get() { # root dir -> "key mode" or empty
-  local sf; sf=$(state_file "$1")
+set_state_get() { # root dir -> $HUSK_REC, "key mode" or empty
+  # A three-column lookup in a file with a handful of rows does not need awk,
+  # and `rec=$(state_get ...)` cost a fork on top of the exec.
+  local sf d k m
+  HUSK_REC=""
+  set_state_file "$1"; sf=$HUSK_SF
   [ -f "$sf" ] || return 0
-  awk -F'\t' -v d="$2" '$1==d {print $2, $3}' "$sf"
+  while IFS=$HUSK_TAB read -r d k m; do
+    if [ "$d" = "$2" ]; then HUSK_REC="$k $m"; return 0; fi
+  done < "$sf"
 }
+state_get() { set_state_get "$1" "$2"; printf '%s' "$HUSK_REC"; }
 
 state_set() { # root dir key mode
   # read-filter-rewrite under the state lock: two concurrent husk processes
   # updating DIFFERENT dirs in the same worktree must not lose each other's
   # row (a lost row makes gc think the entry is unreferenced)
   local root="$1" sf tmp lock
-  sf=$(state_file "$root"); tmp="$sf.tmp.$$"
+  set_state_file "$root"; sf=$HUSK_SF; tmp="$sf.tmp.$$"
   mkdir -p "$root/.husk"
   lock="$sf.lock"
   acquire_lock "$lock"
@@ -408,7 +833,7 @@ state_set() { # root dir key mode
 
 state_del() { # root dir
   local root="$1" sf tmp lock
-  sf=$(state_file "$root"); [ -f "$sf" ] || return 0
+  set_state_file "$root"; sf=$HUSK_SF; [ -f "$sf" ] || return 0
   tmp="$sf.tmp.$$"
   lock="$sf.lock"
   acquire_lock "$lock"
@@ -417,8 +842,15 @@ state_del() { # root dir
 }
 
 add_ref() { # entry worktree-root
-  local refs="$1.refs"
-  grep -qxF "$2" "$refs" 2>/dev/null || printf '%s\n' "$2" >> "$refs"
+  # Read loop rather than `grep -qxF`: the ref list is one line per worktree and
+  # this runs on every link, so it is not worth a process.
+  local refs="$1.refs" line
+  if [ -f "$refs" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ "$line" = "$2" ] && return 0
+    done < "$refs"
+  fi
+  printf '%s\n' "$2" >> "$refs"
 }
 
 del_ref() { # entry worktree-root
@@ -437,7 +869,7 @@ del_ref() { # entry worktree-root
 # them, and symlink mode write-guards the entry root.
 nearest_sibling() { # entry -> newest sibling entry for the same dir, or empty
   local entry="$1" parent d best="" bm=0 m
-  parent=$(dirname "$entry")
+  dir_of "$entry"; parent=$HUSK_DIRN
   for d in "$parent"/*; do
     [ -d "$d" ] || continue
     [ "$d" = "$entry" ] && continue
@@ -561,7 +993,7 @@ seed_entry_locked() { # source-real-dir entry -> seeds; caller MUST hold the ent
     [ -n "$sib" ] && dedupe_entry "$tmp" "$sib"
   fi
   sig_file_for "$tmp" >/dev/null 2>&1 || true   # cache manifest for future siblings
-  date +%s > "$tmp/.husk-seeded" 2>/dev/null || true
+  now_ts; printf '%s\n' "$HUSK_NOW" > "$tmp/.husk-seeded" 2>/dev/null || true
   publish_entry "$tmp" "$entry"
   HUSK_CLEAN_TMP=""
 }
@@ -569,7 +1001,7 @@ seed_entry_locked() { # source-real-dir entry -> seeds; caller MUST hold the ent
 seed_entry() { # source-real-dir entry -> seeds store entry atomically (no-op if exists)
   local src="$1" entry="$2" parent lock
   [ -d "$entry" ] && return 0
-  parent=$(dirname "$entry"); mkdir -p "$parent"
+  dir_of "$entry"; parent=$HUSK_DIRN; mkdir -p "$parent"
   lock="$entry.lock"
   acquire_lock "$lock"
   if [ -d "$entry" ]; then release_lock "$lock"; return 0; fi  # raced, winner seeded
@@ -593,15 +1025,33 @@ swap_in() { # tmp target -> make tmp live at target, then discard the old tree.
   return 0
 }
 
+consume_prefarm() { # target entry mode -> 0 if the staged speculative tree was swapped in
+  [ -n "${HUSK_PREFARM_TMP:-}" ] || return 1
+  [ "$2" = "${HUSK_PREFARM_ENTRY:-}" ] || return 1
+  [ "$3" = "${HUSK_PREFARM_MODE:-}" ] || return 1
+  # the farm runs in cmd_add's shell, not ours: rendezvous on marker files
+  local n=0
+  while [ ! -e "$HUSK_PREFARM_TMP.done" ] && [ ! -e "$HUSK_PREFARM_TMP.failed" ]; do
+    [ "$n" -ge 3000 ] && return 1
+    sleep 0.1; n=$((n + 1))
+  done
+  [ -e "$HUSK_PREFARM_TMP.done" ] && [ -d "$HUSK_PREFARM_TMP" ] || return 1
+  strip_meta "$HUSK_PREFARM_TMP"
+  swap_in "$HUSK_PREFARM_TMP" "$1" || return 1
+  chmod u+w "$1" 2>/dev/null || true
+  return 0
+}
+
 provision() { # entry target mode
   local entry="$1" target="$2" mode="$3" tmp
   # in-use stamp: a brand-new worktree's ref+state are written only AFTER
   # provisioning, so a long copy from an old entry is invisible to gc's
   # refcheck. The stamp (sibling file, never inside the write-guarded entry)
   # buys the same 10-minute grace a fresh seed gets.
-  date +%s > "$entry.used" 2>/dev/null || true
+  now_ts; printf '%s\n' "$HUSK_NOW" > "$entry.used" 2>/dev/null || true
   case "$mode" in
     clone)
+      consume_prefarm "$target" "$entry" "$mode" && return 0
       tmp="$target.husk-tmp.$$"
       HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
@@ -611,6 +1061,7 @@ provision() { # entry target mode
       HUSK_CLEAN_TMP=""
       chmod u+w "$target" 2>/dev/null || true ;;   # private copy: undo inherited write guard
     hardlink)
+      consume_prefarm "$target" "$entry" "$mode" && return 0
       tmp="$target.husk-tmp.$$"
       HUSK_CLEAN_TMP="$tmp"
       rm_rf_safe "$tmp"
@@ -623,12 +1074,15 @@ provision() { # entry target mode
       chmod a-w "$entry" 2>/dev/null || true   # write guard: installs via link fail loud (EACCES)
       tmp="$target.husk-tmp.$$"
       rm -f "$tmp"
-      ln -s "$entry" "$tmp" 2>/dev/null || { rm_rf_safe "$tmp"; return 1; }
-      # MSYS/Git Bash without symlink privilege fakes 'ln -s' with a COPY:
-      # recording mode=symlink over a copy would claim sharing that isn't
-      # happening (and drag store metadata into the worktree). Fail instead;
-      # link_one falls back to copy and records the truth.
-      [ -L "$tmp" ] || { rm_rf_safe "$tmp"; return 1; }
+      if ! { ln -s "$entry" "$tmp" 2>/dev/null && [ -L "$tmp" ]; }; then
+        # MSYS/Git Bash without symlink privilege fakes 'ln -s' with a COPY.
+        # Recording mode=symlink over a copy would claim sharing that isn't
+        # happening (and drag store metadata into the worktree), so the fake is
+        # thrown away and a junction -- the one directory link Windows grants
+        # an unprivileged user -- is tried in its place.
+        rm_rf_safe "$tmp"
+        make_junction "$tmp" "$entry" || { rm_rf_safe "$tmp"; return 1; }
+      fi
       swap_in "$tmp" "$target" || { rm -f "$tmp"; return 1; } ;;
     copy)
       tmp="$target.husk-tmp.$$"
@@ -643,7 +1097,7 @@ provision() { # entry target mode
   esac
   # re-stamp on completion: a copy that itself took longer than gc's grace
   # would otherwise finish with an already-expired stamp
-  date +%s > "$entry.used" 2>/dev/null || true
+  now_ts; printf '%s\n' "$HUSK_NOW" > "$entry.used" 2>/dev/null || true
 }
 
 # ---------- installer detection ----------
@@ -673,25 +1127,28 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
   local key entry mode donor target rec
 
   target="$root/$dir"
-  key=$(key_for "$root" "$dir")
+  set_key_for "$root" "$dir"; key=$HUSK_KEY
   if [ -z "$key" ]; then
     note "$dir: no lockfile or manifest to fingerprint; refusing to share (use your installer directly)"
     return 2
   fi
-  entry=$(entry_path "$dir" "$key")
+  set_entry_path "$dir" "$key"; entry=$HUSK_ENTRY
   # memoized: a multi-dir link pays one filesystem probe, not one per dir
-  local pkey; pkey="$HUSK_MODE|$(store_base)|$root"
+  local pkey; set_store_base; pkey="$HUSK_MODE|$HUSK_SB|$root"
   if [ "$PROBE_CACHE_KEY" = "$pkey" ]; then
     mode=$PROBE_CACHE_VAL
   else
-    mode=$(probe_mode "$(store_base)" "$root")
+    set_probe_mode "$HUSK_SB" "$root"; mode=$HUSK_PROBE
     PROBE_CACHE_KEY=$pkey; PROBE_CACHE_VAL=$mode
   fi
 
   # idempotence: already linked to the right entry?
-  rec=$(state_get "$root" "$dir")
+  set_state_get "$root" "$dir"; rec=$HUSK_REC
   if [ -n "$rec" ] && [ "${rec%% *}" = "$key" ]; then
-    if [ -L "$target" ] && [ "$(readlink "$target")" = "$entry" ] && [ -d "$entry" ]; then
+    # -ef, not readlink: it costs no subshell, and MSYS resolves a junction
+    # through its own mount table, so the same directory can read back under a
+    # different spelling than the one husk wrote.
+    if [ -L "$target" ] && [ -d "$entry" ] && [ "$target" -ef "$entry" ]; then
       out "linked dir=$dir mode=symlink key=$key entry=$entry (already)"
       return 0
     fi
@@ -713,9 +1170,10 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
   fi
   # 2. donor (main worktree) has a real dir whose lockfile matches ours
   if [ ! -d "$entry" ]; then
-    donor=$(main_worktree)
+    set_main_worktree; donor=$HUSK_MAIN
     if [ -n "$donor" ] && [ "$donor" != "$root" ] && [ -d "$donor/$dir" ] && [ ! -L "$donor/$dir" ]; then
-      if [ "$(key_for "$donor" "$dir")" = "$key" ]; then
+      set_key_for "$donor" "$dir"
+      if [ "$HUSK_KEY" = "$key" ]; then
         seed_entry "$donor/$dir" "$entry"
       fi
     fi
@@ -724,7 +1182,7 @@ link_one() { # root dir do_install -> exit 0 linked, 2 needs-install
   # entry lock so N agents hitting a fresh lockfile run ONE installer, not N:
   # the winner installs + seeds, the rest wake to a ready entry and provision.
   if [ ! -d "$entry" ] && [ "$do_install" = "1" ]; then
-    mkdir -p "$(dirname "$entry")"
+    dir_of "$entry"; mkdir -p "$HUSK_DIRN"
     acquire_lock "$entry.lock"
     if [ ! -d "$entry" ]; then
       note "$dir: store miss; running installer"
@@ -771,8 +1229,8 @@ cmd_link() {
       *) dirs="$dirs $1" ;;
     esac; shift
   done
-  root=$(repo_root); load_conf "$root"
-  [ -n "${dirs// /}" ] || dirs=$(detect_dirs "$root")
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  [ -n "${dirs// /}" ] || { set_detect_dirs "$root"; dirs=$HUSK_DEPDIRS; }
   [ -n "${dirs// /}" ] || { note "nothing to link (no known dependency dirs or lockfiles found)"; return 0; }
   local r
   for d in $dirs; do
@@ -798,6 +1256,46 @@ cmd_add() {
   [ -n "$path" ] || die "usage: husk add <path> [branch]"
   repo_root >/dev/null
 
+  # speculative provision: farm the store entry for the CURRENT lockfile into
+  # a staging dir WHILE git populates the worktree, so wall time approaches
+  # max(checkout, farm) instead of checkout + farm. A new branch almost always
+  # shares HEAD's lockfile, so the staged tree is almost always used; link_one
+  # re-derives the key from the REAL checkout and consume_prefarm only accepts
+  # the stage on an exact entry+mode match. Any mismatch (diverged lockfile,
+  # different mode, farm failure) falls through to the normal sequential path.
+  # Worst case is wasted work in the staging dir, never a wrong link.
+  # HUSK_PREFARM=0 disables.
+  local sroot sdir skey sentry smode sparent
+  if [ "${HUSK_PREFARM:-1}" != "0" ]; then
+    set_repo_root; sroot=$HUSK_RR; load_conf "$sroot"
+    dir_of "$path"; sparent=$HUSK_DIRN
+    if [ -d "$sparent" ]; then
+      set_detect_dirs "$sroot"
+      for sdir in $HUSK_DEPDIRS; do
+        set_key_for "$sroot" "$sdir" || true; skey=$HUSK_KEY
+        [ -n "$skey" ] || continue
+        set_entry_path "$sdir" "$skey"; sentry=$HUSK_ENTRY
+        [ -d "$sentry" ] || continue
+        set_store_base; set_probe_mode "$HUSK_SB" "$sparent"; smode=$HUSK_PROBE
+        case "$smode" in clone|hardlink) ;; *) continue ;; esac
+        base_of "$path"; HUSK_PREFARM_TMP="$sparent/$HUSK_BASE.husk-pre.$$"
+        rm_rf_safe "$HUSK_PREFARM_TMP"
+        now_ts; printf '%s\n' "$HUSK_NOW" > "$sentry.used" 2>/dev/null || true
+        if [ "$smode" = "clone" ]; then
+          ( cow_clone "$sentry" "$HUSK_PREFARM_TMP" \
+              && : > "$HUSK_PREFARM_TMP.done" || : > "$HUSK_PREFARM_TMP.failed" ) &
+        else
+          ( hardlink_farm "$sentry" "$HUSK_PREFARM_TMP" \
+              && : > "$HUSK_PREFARM_TMP.done" || : > "$HUSK_PREFARM_TMP.failed" ) &
+        fi
+        HUSK_PREFARM_PID=$!
+        HUSK_PREFARM_ENTRY="$sentry"
+        HUSK_PREFARM_MODE="$smode"
+        break   # one dir is the common case; the rest link sequentially
+      done
+    fi
+  fi
+
   if [ -n "$branch" ]; then
     if git show-ref --verify --quiet "refs/heads/$branch"; then
       # shellcheck disable=SC2086
@@ -816,16 +1314,27 @@ cmd_add() {
   local link_rc=0
   # shellcheck disable=SC2086
   ( cd "$path" && cmd_link $install_flag ) || link_rc=$?
-  out "worktree path=$(abspath "$path")"
+  # discard an unused stage (consume_prefarm mv'd it away if it was used)
+  if [ -n "$HUSK_PREFARM_TMP" ]; then
+    wait 2>/dev/null || true
+    [ -e "$HUSK_PREFARM_TMP" ] && rm_rf_safe "$HUSK_PREFARM_TMP"
+    rm -f "$HUSK_PREFARM_TMP.done" "$HUSK_PREFARM_TMP.failed" 2>/dev/null || true
+    HUSK_PREFARM_TMP="" HUSK_PREFARM_PID=""
+  fi
+  set_abspath "$path"; out "worktree path=$HUSK_ABS"
 
-  # opportunistic reap nudge (no daemon; fleet stays bounded). The probe walks
-  # every worktree, so throttle it to hourly: at 100 worktrees an unthrottled
-  # probe makes every 'husk add' pay ~100 'git status' calls
+  # Opportunistic reap nudge (no daemon; fleet stays bounded). The probe is a
+  # full reap dry-run, which costs a handful of git invocations PER WORKTREE --
+  # at the 20-100 worktrees husk is built for, that is the most expensive thing
+  # `husk add` does, and it lands on whichever add happens to cross the window.
+  # A stale-worktree hint is not time-critical, so the window is a day rather
+  # than an hour: same warning, 24x less amortised cost. HUSK_NUDGE_SECS still
+  # overrides it, and 0 forces the probe every time.
   local stale stamp nowts last
-  stamp="$(repo_common_dir)/husk-reap-probe"
-  nowts=$(date +%s); last=$(cat "$stamp" 2>/dev/null || echo 0)
+  set_repo_common_dir; stamp="$HUSK_RCD/husk-reap-probe"
+  now_ts; nowts=$HUSK_NOW; last=$(cat "$stamp" 2>/dev/null || echo 0)
   case "$last" in *[!0-9]*|"") last=0 ;; esac
-  if [ $((nowts - last)) -ge "${HUSK_NUDGE_SECS:-3600}" ]; then
+  if [ $((nowts - last)) -ge "${HUSK_NUDGE_SECS:-86400}" ]; then
     printf '%s' "$nowts" > "$stamp" 2>/dev/null || true
     stale=$(cmd_reap --dry-run --quiet | grep -c '^reap ' || true)
     [ "$stale" -gt 0 ] && note "$stale stale worktree(s) detected; run 'husk reap' to clean up"
@@ -836,13 +1345,15 @@ cmd_add() {
 # ---------- unlink (materialize private copy) ----------
 cmd_unlink() {
   local root dirs="" d rec key mode entry target tmp
-  root=$(repo_root); load_conf "$root"
-  [ $# -gt 0 ] && dirs="$*" || dirs=$(awk -F'\t' '{print $1}' "$(state_file "$root")" 2>/dev/null || true)
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_state_file "$root"
+  [ $# -gt 0 ] && dirs="$*" || dirs=$(awk -F'\t' '{print $1}' "$HUSK_SF" 2>/dev/null || true)
   [ -n "${dirs// /}" ] || { note "nothing linked"; return 0; }
   for d in $dirs; do
-    rec=$(state_get "$root" "$d"); [ -n "$rec" ] || { note "$d: not linked, skipping"; continue; }
+    set_state_get "$root" "$d"; rec=$HUSK_REC
+    [ -n "$rec" ] || { note "$d: not linked, skipping"; continue; }
     key="${rec%% *}"; mode="${rec##* }"
-    entry=$(entry_path "$d" "$key")
+    set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
     target="$root/$d"
     if [ -L "$target" ]; then
       tmp="$target.husk-tmp.$$"
@@ -884,11 +1395,13 @@ cmd_unlink() {
 # ---------- adopt (seed store from this checkout) ----------
 cmd_adopt() {
   local root d key entry
-  root=$(repo_root); load_conf "$root"
-  for d in $(detect_dirs "$root"); do
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_detect_dirs "$root"
+  for d in $HUSK_DEPDIRS; do
     [ -d "$root/$d" ] && [ ! -L "$root/$d" ] || continue
-    key=$(key_for "$root" "$d"); [ -n "$key" ] || { note "$d: unfingerprintable, skipping"; continue; }
-    entry=$(entry_path "$d" "$key")
+    set_key_for "$root" "$d"; key=$HUSK_KEY
+    [ -n "$key" ] || { note "$d: unfingerprintable, skipping"; continue; }
+    set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
     seed_entry "$root/$d" "$entry"
     out "adopted dir=$d key=$key entry=$entry"
   done
@@ -897,20 +1410,21 @@ cmd_adopt() {
 # ---------- status ----------
 cmd_status() {
   local root sf base d key mode entry ok stale
-  root=$(repo_root); load_conf "$root"
-  base=$(store_base)
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_store_base; base=$HUSK_SB
   out "worktree=$root"
   out "store=$base"
-  sf=$(state_file "$root")
+  set_state_file "$root"; sf=$HUSK_SF
   if [ -f "$sf" ]; then
-    while IFS=$(printf '\t') read -r d key mode; do
-      entry=$(entry_path "$d" "$key")
+    while IFS=$HUSK_TAB read -r d key mode; do
+      set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
       ok=ok
       [ -d "$entry" ] || ok=missing-entry
       if [ "$mode" = "symlink" ] && [ ! -L "$root/$d" ]; then ok=not-a-link; fi
       if [ -L "$root/$d" ] && [ ! -e "$root/$d" ]; then ok=dangling; fi
       stale=""
-      [ "$(key_for "$root" "$d")" != "$key" ] && stale=" drift=lockfile-changed"
+      set_key_for "$root" "$d"
+      [ "$HUSK_KEY" = "$key" ] || stale=" drift=lockfile-changed"
       out "dep dir=$d mode=$mode key=$key state=$ok$stale"
     done < "$sf"
   else
@@ -922,15 +1436,87 @@ cmd_status() {
   fi
 }
 
+# ---------- list (fleet view) ----------
+# status answers "how is THIS worktree wired". With 20-100 worktrees the
+# question is "how is the FLEET wired, and what is the sharing actually
+# buying me". saved_mb is what a copy per worktree would have cost that the
+# store does not: for an entry referenced by R worktrees, (R-1) x its size.
+# Only sharing modes count; a copy-mode dir saves nothing and says so.
+cmd_list() {
+  local root base tmp wt branch sf d key mode entry st cnt size cur live
+  local n_wt=0 n_entries=0 total_saved=0 store_mb=0
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_store_base; base=$HUSK_SB
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/husk-list.XXXXXX") || die "mktemp failed"
+  HUSK_CLEAN_TMP="$tmp"
+
+  git worktree list --porcelain 2>/dev/null \
+    | sed -n 's/^worktree //p' | posix_path_stream > "$tmp/wts"
+  while read -r wt; do
+    [ -n "$wt" ] && [ -d "$wt" ] || continue
+    n_wt=$((n_wt + 1))
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    out "wt path=$wt branch=$branch"
+    set_state_file "$wt"; sf=$HUSK_SF
+    [ -f "$sf" ] || continue
+    while IFS=$HUSK_TAB read -r d key mode; do
+      [ -n "$d" ] || continue
+      set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
+      st=ok; live=1
+      [ -d "$entry" ] || { st=missing-entry; live=0; }
+      [ -e "$wt/$d" ] || { st=missing-dir; live=0; }
+      if [ "$mode" = "symlink" ] && [ ! -L "$wt/$d" ]; then st=not-a-link; live=0; fi
+      # Drift means the lockfile moved on, not that sharing stopped: the dir is
+      # still linked to the entry, so its bytes still count as saved. Report it,
+      # but keep it a live reference. key_for is empty when the dir has no
+      # fingerprint file, which is not drift either.
+      set_key_for "$wt" "$d" 2>/dev/null || true; cur=$HUSK_KEY
+      [ -z "$cur" ] || [ "$cur" = "$key" ] || st="$st drift=lockfile-changed"
+      out "dep wt=$wt dir=$d mode=$mode key=$key state=$st"
+      # only sharing modes dedupe bytes; a copy-mode dir saves nothing
+      case "$mode" in
+        clone|hardlink|symlink)
+          if [ "$live" -eq 1 ]; then
+            printf '%s\t%s\n' "$key" "$d" >> "$tmp/refs"
+          fi ;;
+      esac
+    done < "$sf"
+  done < "$tmp/wts"
+
+  if [ -f "$tmp/refs" ]; then
+    sort "$tmp/refs" | uniq -c > "$tmp/counts"
+    # 'd' takes the rest of the line, so dep dirs containing spaces survive
+    while read -r cnt key d; do
+      [ -n "$key" ] || continue
+      set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
+      [ -d "$entry" ] || continue
+      size=$(du -sk "$entry" 2>/dev/null | cut -f1)
+      case "$size" in ''|*[!0-9]*) size=0 ;; esac
+      n_entries=$((n_entries + 1))
+      total_saved=$((total_saved + size * (cnt - 1) / 1024))
+      out "entry dir=$d key=$key refs=$cnt size_mb=$((size / 1024)) saved_mb=$((size * (cnt - 1) / 1024))"
+    done < "$tmp/counts"
+  fi
+
+  if [ -d "$base" ]; then
+    store_mb=$(du -sk "$base" 2>/dev/null | cut -f1)
+    case "$store_mb" in ''|*[!0-9]*) store_mb=0 ;; esac
+    store_mb=$((store_mb / 1024))
+  fi
+  out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved"
+  rm -rf "$tmp"; HUSK_CLEAN_TMP=""
+}
+
 # ---------- doctor ----------
 cmd_doctor() {
-  local fix=0 root sf d key mode entry issues=0
+  local fix=0 root sf d key mode entry base issues=0
   [ "${1:-}" = "--fix" ] && fix=1
-  root=$(repo_root); load_conf "$root"
-  sf=$(state_file "$root")
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_store_base; base=$HUSK_SB
+  set_state_file "$root"; sf=$HUSK_SF
   if [ -f "$sf" ]; then
-    while IFS=$(printf '\t') read -r d key mode; do
-      entry=$(entry_path "$d" "$key")
+    while IFS=$HUSK_TAB read -r d key mode; do
+      set_entry_path "$d" "$key"; entry=$HUSK_ENTRY
       # dangling link
       if [ -L "$root/$d" ] && [ ! -e "$root/$d" ]; then
         issues=$((issues+1))
@@ -943,7 +1529,8 @@ cmd_doctor() {
         fi
       fi
       # lockfile drift
-      if [ -n "$key" ] && [ "$(key_for "$root" "$d")" != "$key" ]; then
+      set_key_for "$root" "$d"
+      if [ -n "$key" ] && [ "$HUSK_KEY" != "$key" ]; then
         issues=$((issues+1))
         if [ $fix -eq 1 ]; then
           note "$d: lockfile drifted; re-keying (mode $mode)"
@@ -956,7 +1543,7 @@ cmd_doctor() {
   fi
   # stale locks in store
   local lock pid
-  for lock in "$(store_base)"/*/*.lock; do
+  for lock in "$base"/*/*.lock; do
     [ -d "$lock" ] || continue
     pid=$(cat "$lock/pid" 2>/dev/null || echo "")
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
@@ -971,7 +1558,8 @@ cmd_doctor() {
   # replace (worktree), or live-dedupe swap (store, .husk-dd files).
   # The pid is baked into the name; skip residue whose owner is still running.
   local tmpd
-  for tmpd in "$(store_base)"/*/*.tmp.* "$root"/*.husk-tmp.* "$root"/*.husk-old.*; do
+  for tmpd in "$base"/*/*.tmp.* "$root"/*.husk-tmp.* "$root"/*.husk-old.* \
+              "$root"/../*.husk-pre.*; do
     [ -e "$tmpd" ] || [ -L "$tmpd" ] || continue
     pid=${tmpd##*.}
     case "$pid" in *[!0-9]*|'') pid="" ;; esac
@@ -992,7 +1580,7 @@ cmd_doctor() {
     if [ $fix -eq 1 ]; then note "removing dedupe residue: $tmpd"; rm -f "$tmpd"
     else out "issue kind=tmp-residue path=$tmpd fix='husk doctor --fix'"; fi
   done <<DDRES
-$(find "$(store_base)" -name '*.husk-dd.*' -type f 2>/dev/null)
+$(find "$base" -name '*.husk-dd.*' -type f 2>/dev/null)
 DDRES
   [ $issues -eq 0 ] && out "doctor ok=1" || out "doctor issues=$issues fixed=$fix"
 }
@@ -1019,17 +1607,21 @@ cmd_reap() {
       *) die "unknown flag for reap: $1" ;;
     esac; shift
   done
-  root=$(repo_root); load_conf "$root"
-  main=$(main_worktree); def=$(default_branch); now=$(date +%s)
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_main_worktree; main=$HUSK_MAIN; def=$(default_branch); now_ts; now=$HUSK_NOW
 
   git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | posix_path_stream | while read -r wt; do
     [ "$wt" = "$main" ] && continue
     [ "$wt" = "$root" ] && continue                       # never reap where we stand
     [ -d "$wt" ] || continue
-    # clean?
-    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then continue; fi
-    # age: last activity = max(worktree HEAD-file mtime, last commit time).
-    # NOT the index mtime - 'git status' (incl. our own clean check) refreshes it.
+    # AGE FIRST, deliberately. `git status --porcelain` stats the entire working
+    # tree, which is the most expensive question asked here, and the answer is
+    # irrelevant for a worktree that is too young to reap. Since most of a fleet
+    # is young most of the time, checking age first skips the tree walk for
+    # nearly every worktree.
+    #
+    # Age = max(worktree HEAD-file mtime, last commit time). NOT the index
+    # mtime, which any `git status` refreshes.
     idx=$(git -C "$wt" rev-parse --git-dir 2>/dev/null | posix_path_stream)
     [ -n "$idx" ] || idx="$wt/.git"
     local act1 act2 activity
@@ -1038,6 +1630,8 @@ cmd_reap() {
     activity=$act1; [ "$act2" -gt "$activity" ] && activity=$act2
     age=$(( (now - activity) / 86400 ))
     [ "$age" -lt "$days" ] && continue
+    # clean?
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then continue; fi
     # merged or upstream gone?
     br=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
     head=$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "")
@@ -1054,10 +1648,10 @@ cmd_reap() {
       [ $quiet -eq 0 ] && note "reaping $wt (${br:-detached}, $reason, ${age}d idle)"
       # deref store entries this worktree used
       local sf d k _m e
-      sf=$(state_file "$wt")
+      set_state_file "$wt"; sf=$HUSK_SF
       if [ -f "$sf" ]; then
-        while IFS=$(printf '\t') read -r d k _m; do
-          e=$(entry_path "$d" "$k"); del_ref "$e" "$wt"
+        while IFS=$HUSK_TAB read -r d k _m; do
+          set_entry_path "$d" "$k"; del_ref "$HUSK_ENTRY" "$wt"
         done < "$sf"
       fi
       git worktree remove --force "$wt" 2>/dev/null || git worktree remove "$wt"
@@ -1070,16 +1664,17 @@ cmd_reap() {
 
 # ---------- gc (drop unreferenced store entries) ----------
 wt_uses_key() { # worktree key -> 0 if the worktree's state records this key
-  [ -d "$1" ] && [ -f "$(state_file "$1")" ] \
-    && awk -F'\t' -v k="$2" '$2==k{found=1} END{exit !found}' "$(state_file "$1")" 2>/dev/null
+  set_state_file "$1"
+  [ -d "$1" ] && [ -f "$HUSK_SF" ] \
+    && awk -F'\t' -v k="$2" '$2==k{found=1} END{exit !found}' "$HUSK_SF" 2>/dev/null
 }
 
 cmd_gc() {
   local dry=0 base entry refs live wt freed key now seeded used wt_list
   [ "${1:-}" = "--dry-run" ] && dry=1
-  base=$(store_base)
+  set_store_base; base=$HUSK_SB
   [ -d "$base" ] || { out "gc entries=0"; return 0; }
-  now=$(date +%s)
+  now_ts; now=$HUSK_NOW
   # authoritative consumers: this repo's actual worktrees. The .refs files are
   # advisory only - a process killed between state_set and add_ref leaves a
   # live worktree with no ref, and trusting refs alone would delete an entry
@@ -1098,7 +1693,7 @@ cmd_gc() {
     case "$used" in *[!0-9]*|"") used=0 ;; esac
     [ $((now - used)) -lt 600 ] && continue
     refs="$entry.refs"
-    key=$(basename "$entry")
+    base_of "$entry"; key=$HUSK_BASE
     live=0
     if [ -f "$refs" ]; then
       while read -r wt; do
@@ -1131,7 +1726,7 @@ WTS
         case "$used" in *[!0-9]*|"") used=0 ;; esac
         seeded=$(cat "$entry/.husk-seeded" 2>/dev/null || echo 0)
         case "$seeded" in *[!0-9]*|"") seeded=0 ;; esac
-        now=$(date +%s)
+        now_ts; now=$HUSK_NOW
         if [ $((now - used)) -lt 600 ] || [ $((now - seeded)) -lt 600 ]; then
           rm -rf "$entry.lock"; continue
         fi
@@ -1147,9 +1742,9 @@ WTS
 
 # ---------- dedupe (share identical files across existing store entries) ----------
 cmd_dedupe() {
-  local base dirp entry prev root
-  root=$(repo_root); load_conf "$root"
-  base=$(store_base)
+  local base dirp entry prev root dp en
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_store_base; base=$HUSK_SB
   [ -d "$base" ] || { out "dedupe entries=0"; return 0; }
   for dirp in "$base"/*; do
     [ -d "$dirp" ] || continue
@@ -1159,7 +1754,8 @@ cmd_dedupe() {
       [ -n "$entry" ] && [ -d "$entry" ] || continue
       case "$entry" in *.tmp.*|*.lock) continue ;; esac
       if [ -n "$prev" ]; then
-        note "dedupe: $(basename "$dirp")/$(basename "$entry") vs $(basename "$prev")"
+        base_of "$dirp"; dp=$HUSK_BASE; base_of "$entry"; en=$HUSK_BASE; base_of "$prev"
+        note "dedupe: $dp/$en vs $HUSK_BASE"
         dedupe_entry "$entry" "$prev" 1
       fi
       prev="$entry"
@@ -1175,7 +1771,7 @@ agent_snippet() {
   cat <<'EOF'
 <!-- husk:agent-instructions -->
 ## Worktrees (husk)
-- Create worktrees with `husk add <path> <branch>` instead of `git worktree add` — dependencies are provisioned instantly from a shared store.
+- Create worktrees with `husk add <path> <branch>` instead of `git worktree add`. Dependencies are provisioned instantly from a shared store.
 - If any husk command exits with code 2, run `husk link --install` inside that worktree.
 - After changing a lockfile and reinstalling deps, run `husk adopt` so sibling worktrees can share the result.
 - Periodically run `husk reap` (removes only clean + merged + idle worktrees) and `husk gc`.
@@ -1187,7 +1783,7 @@ EOF
 cmd_setup() {
   local write=0 root target
   [ "${1:-}" = "--write" ] && write=1
-  root=$(repo_root); load_conf "$root"
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
   cmd_adopt
   if [ $write -eq 1 ]; then
     target="$root/AGENTS.md"
@@ -1215,17 +1811,20 @@ USAGE
   husk unlink [dir...]                              materialize a private copy, stop sharing
   husk adopt                                        seed the store from this checkout's real dirs
   husk setup [--write]                              adopt + agent instructions (--write appends to AGENTS.md/CLAUDE.md)
-  husk status                                       link states, drift, store size
+  husk status                                       link states, drift, store size (this worktree)
+  husk list                                         every worktree, its deps, and disk saved by sharing
   husk doctor [--fix]                               find/repair dangling links, drift, stale locks
   husk reap [--dry-run] [--days N]                  delete stale worktrees (clean+merged+idle)
   husk gc [--dry-run]                               drop unreferenced store entries
   husk dedupe                                       hardlink identical files across store entries
+  husk version                                      print the husk version
 
 MODES (--mode or HUSK_MODE; default: auto)
   auto      probe filesystem: clone > hardlink > symlink
   clone     CoW clone (APFS/btrfs/XFS) - full isolation, bytes shared until divergence
   hardlink  hardlink farm - file-level dedupe, near-full isolation
   symlink   link to shared store entry - maximal dedupe, shared writes (guarded read-only root)
+            on Windows this is a directory junction, the one link an unprivileged user can make
   copy      plain copy - always correct, no savings
 
 ENV
@@ -1233,8 +1832,11 @@ ENV
   HUSK_MODE       default mode (default auto)
   HUSK_REAP_DAYS  reap idle threshold (default 7)
   HUSK_DEDUPE     hardlink identical files across store entries at seed time (default 1)
+  HUSK_WINFARM    Windows: native CreateHardLinkW farm, 0 to force the portable chain (default 1)
+  HUSK_JUNCTION   Windows: allow directory junctions for symlink mode (default 1)
 
-Config file: .husk.conf at repo root (KEY=VALUE lines, parsed not sourced: HUSK_DIRS="node_modules .venv" etc.)
+Config file: .husk.conf at repo root. KEY=VALUE lines, parsed and never sourced, so a
+  cloned repo cannot run code on 'husk add'. Example: HUSK_DIRS=node_modules .venv
 Output: stdout is stable key=value lines; humans read stderr.
 Exit codes: 0 ok - 2 needs install - 1 error
 EOF
@@ -1251,6 +1853,7 @@ main() {
     adopt)   cmd_adopt "$@" ;;
     setup)   cmd_setup "$@" ;;
     status)  cmd_status "$@" ;;
+    list)    cmd_list "$@" ;;
     doctor)  cmd_doctor "$@" ;;
     reap)    cmd_reap "$@" ;;
     gc)      cmd_gc "$@" ;;
