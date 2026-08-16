@@ -400,6 +400,39 @@ touch -t 202601010101 "$pl_entry.lock"              # far in the past
 assert "pid-less stale lock is stolen, link reseeds" bash -c "cd '$TMP/pl' && HUSK_LOCK_TIMEOUT=90 '$HUSK' link | grep -q linked"
 assert "stolen lock is gone" bash -c "[ ! -d '$pl_entry.lock' ]"
 
+# steal_lock must NOT destroy a FRESH pid-less lock: that is a live holder
+# caught between its mkdir and its pid write, not an orphan. A stale-pid
+# stealer racing a fresh acquisition used to rm the winner's lock, letting
+# two processes hold it and lose state rows. Unit-level: call the function.
+sed -n '/^mtime_of()/,/^}/p; /^steal_lock()/,/^}/p' "$HUSK" > "$TMP/lockfns.sh"
+mkdir "$TMP/fresh.lock"
+sl_rc=0
+( . "$TMP/lockfns.sh"; steal_lock "$TMP/fresh.lock" 99999 ) >/dev/null 2>&1 || sl_rc=$?
+assert "steal_lock refuses a fresh pid-less lock" test "$sl_rc" -ne 0
+assert "refused fresh lock is restored intact" test -d "$TMP/fresh.lock"
+mkdir "$TMP/orphan.lock"; touch -t 202601010101 "$TMP/orphan.lock"
+sl_rc=0
+( . "$TMP/lockfns.sh"; steal_lock "$TMP/orphan.lock" "" ) >/dev/null 2>&1 || sl_rc=$?
+assert "steal_lock takes an aged pid-less orphan" test "$sl_rc" -eq 0
+assert "aged orphan lock is gone" bash -c "[ ! -d '$TMP/orphan.lock' ]"
+
+# concurrent first-time links in ONE worktree: the per-worktree state lock
+# must not lose rows (a lost row makes gc think that entry is unreferenced)
+make_repo "$TMP/cc" "cc-lock-v1"
+cd "$TMP/cc" || exit 1
+printf 'py\n' > pyproject.toml; printf 'rs\n' > Cargo.toml
+printf 'rb\n' > Gemfile; printf 'pod\n' > Podfile
+mkdir -p .venv/lib venv/lib target/debug vendor/gems Pods/pods
+echo a > .venv/lib/a; echo b > venv/lib/b; echo c > target/debug/c
+echo d > vendor/gems/d; echo e > Pods/pods/e
+git add -A; git commit -qm deps
+for ccd in node_modules .venv venv target vendor Pods; do
+  ( cd "$TMP/cc" && "$HUSK" link "$ccd" >/dev/null 2>&1 ) &
+done
+wait
+cc_rows=$(wc -l < "$TMP/cc/.husk/state" | tr -d ' ')
+assert "6 concurrent links keep all 6 state rows" test "$cc_rows" -eq 6
+
 # gc honors the in-use stamp: old unreferenced entry mid-provision must survive
 pl_store=$(dirname "$pl_entry")
 mkdir -p "$pl_store/cafebabecafebabe"; echo x > "$pl_store/cafebabecafebabe/f"
