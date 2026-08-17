@@ -42,6 +42,10 @@ HUSK_OS_TAG=""
 HUSK_ARCH=""
 HUSK_SHA_CMD=""    # resolved hasher: shasum -a 256 or sha256sum
 HUSK_DRIVE_SHORTCUT=-1   # -1 untested, 1 shell C:/ -> /c/ agrees with cygpath, 0 it does not
+HUSK_WIN_SHORTCUT=-1     # 1 once the /c/ -> C:\ rewrite has been confirmed for some
+                         # drive; trust itself is per letter, in HUSK_WVER_<LETTER>
+HUSK_WP=""             # set_win_path result
+HUSK_LINE=""           # set_first_line result
 HUSK_MAIN=""       # main_worktree
 HUSK_EXCLUDED=0    # exclude_husk_dir already ran
 HUSK_CONF_FOR=""   # root that load_conf was last run for
@@ -101,6 +105,17 @@ mtime_of() { # file -> epoch seconds
   else stat -c %Y "$1"; fi
 }
 
+set_first_line() { # file -> $HUSK_LINE, empty if unreadable
+  # husk keeps a lot of one-line state files (lock pids, reap stamps, .used
+  # timestamps) and read them all through $(cat ...), which is a fork plus a
+  # command substitution. Both are free as builtins, and on Windows the pair
+  # costs more than everything the caller then does with the answer.
+  HUSK_LINE=""
+  [ -f "$1" ] || return 0
+  IFS= read -r HUSK_LINE < "$1" 2>/dev/null || true
+  return 0
+}
+
 batch_hash() { # stdin: NUL-separated paths -> "HASH  path" lines
   # openssl and sha256sum are C implementations; shasum is perl (~8x slower)
   if openssl sha256 -r /dev/null >/dev/null 2>&1; then xargs -0 openssl sha256 -r 2>/dev/null
@@ -139,6 +154,12 @@ set_posix_path() { # path -> $HUSK_PP
   if [ "$ck" = "$1" ]; then eval "HUSK_PP=\${${k}_V}"; return 0; fi
   case "$1" in
     [A-Za-z]:*) drive_to_posix "$1" ;;
+    # A /<letter>/ path already has a mechanical Windows form, so ask
+    # set_win_path for it instead of paying cygpath -m. It answers from the
+    # shell once it has checked that letter against cygpath, and hands back
+    # cygpath's own answer when it has not, so this branch is the same
+    # canonicalization for zero processes rather than one.
+    /[A-Za-z]/*) set_win_path "$1"; drive_to_posix "$HUSK_WP" ;;
     /*)         HUSK_PP=$(cygpath -m "$1"); drive_to_posix "$HUSK_PP" ;;
     *)          HUSK_PP=$1; return 0 ;;
   esac
@@ -172,6 +193,42 @@ drive_to_posix() { # C:/foo or C:\foo -> /c/foo, in the shell, setting $HUSK_PP
 
 posix_path_stream() { # stdin: one path per line -> POSIX view (no-op off Windows)
   if [ "$HUSK_HAVE_CYGPATH" = 1 ]; then cygpath -u -f -; else cat; fi
+}
+
+set_win_path() { # /c/foo -> $HUSK_WP as C:\foo, in the shell where it can be
+  # The mirror of drive_to_posix, for the handful of places that must hand a
+  # path to a native Windows exe. Measured here: `cygpath -w` costs ~340ms
+  # including the command substitution, and the native farm alone asked for
+  # three of them per `husk add`.
+  #
+  # Same contract as the posix direction, for the same reason: only /<letter>/
+  # paths have a mechanical Windows form, and anything under an MSYS mount alias
+  # (/tmp, /usr/bin) does not.
+  #
+  # The check against cygpath is per drive letter, not once per process. /c is a
+  # real drive on every box, but /x could be a custom fstab mount, and a single
+  # global "the shortcut works" would let the answer for C: vouch for X:. One
+  # exec per letter ever used -- in practice exactly one -- then none.
+  if [ "$HUSK_HAVE_CYGPATH" != 1 ]; then HUSK_WP=$1; return 0; fi
+  local d r i up=ABCDEFGHIJKLMNOPQRSTUVWXYZ lo=abcdefghijklmnopqrstuvwxyz cg ok
+  case "$1" in
+    /[A-Za-z]/*) ;;
+    *) HUSK_WP=$(cygpath -w "$1"); return 0 ;;
+  esac
+  d=${1#/}; r=${d#?}; d=${d%%/*}
+  case "$d" in
+    [A-Z]) ;;
+    [a-z]) i=${lo%%"$d"*}; d=${up:${#i}:1} ;;
+    *) HUSK_WP=$(cygpath -w "$1"); return 0 ;;
+  esac
+  eval "ok=\${HUSK_WVER_$d-}"
+  if [ "$ok" = 0 ]; then HUSK_WP=$(cygpath -w "$1"); return 0; fi
+  HUSK_WP="$d:${r//\//\\}"
+  if [ -z "$ok" ]; then
+    cg=$(cygpath -w "$1")
+    if [ "$cg" = "$HUSK_WP" ]; then eval "HUSK_WVER_$d=1"; HUSK_WIN_SHORTCUT=1
+    else eval "HUSK_WVER_$d=0"; HUSK_WP=$cg; fi
+  fi
 }
 
 # ---------- repo context ----------
@@ -365,19 +422,24 @@ set_fingerprint_file() { # root dir -> $HUSK_FP, first existing lockfile (or man
 }
 find_fingerprint_file() { set_fingerprint_file "$1" "$2"; printf '%s' "$HUSK_FP"; }
 
-set_os_tag() { # stable OS identity for store keys. MSYS bakes the Windows build
-  # into 'uname -s' (MINGW64_NT-10.0-26200): left raw, every Windows update
-  # would silently re-key the whole store and force a full reseed.
-  [ -z "$HUSK_OS_TAG" ] || return 0
-  local s; s=$(uname -s)
+set_uname() { # both facts, one process. Two `uname` calls cost two command
+  # substitutions, and a command substitution measures ~183ms on Windows, which
+  # is most of what asking twice costs. `uname -sm` answers both at once.
+  #
+  # MSYS bakes the Windows build into 'uname -s' (MINGW64_NT-10.0-26200): left
+  # raw, every Windows update would silently re-key the whole store and force a
+  # full reseed, so the build suffix is trimmed off.
+  [ -z "$HUSK_OS_TAG" ] || [ -z "$HUSK_ARCH" ] || return 0
+  local u s
+  u=$(uname -sm)
+  s=${u% *}
   case "$s" in MINGW*_NT*|MSYS_NT*|CYGWIN_NT*) s="${s%%-*}" ;; esac
   HUSK_OS_TAG=$s
+  HUSK_ARCH=${u##* }
 }
 
-set_arch_tag() { # machine arch, resolved once per process
-  [ -z "$HUSK_ARCH" ] || return 0
-  HUSK_ARCH=$(uname -m)
-}
+set_os_tag()   { set_uname; }
+set_arch_tag() { set_uname; }
 
 set_key_for() { # root dir -> $HUSK_KEY, content key (empty if unfingerprintable)
   local fp h
@@ -447,7 +509,7 @@ steal_lock() { # lockdir expected-dead-pid -> 0 stolen, 1 lost the race
   # acquired; with rename+verify the mistake is detectable and undone.
   local lock="$1" dead="$2" got age
   mv "$lock" "$lock.stale.$$" 2>/dev/null || return 1
-  got=$(cat "$lock.stale.$$/pid" 2>/dev/null || echo "")
+  set_first_line "$lock.stale.$$/pid"; got=$HUSK_LINE
   if [ -n "$got" ] && [ "$got" != "$dead" ] && kill -0 "$got" 2>/dev/null; then
     # captured a LIVE holder's fresh lock by mistake: give it back
     mv "$lock.stale.$$" "$lock" 2>/dev/null || rm -rf "$lock.stale.$$"
@@ -477,13 +539,14 @@ acquire_lock() { # lockdir
       # lockless (the pid write lands nowhere), so re-enter the wait loop
       # instead of proceeding unlocked.
       echo $$ > "$lock/pid" 2>/dev/null || true
-      if [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ]; then
+      set_first_line "$lock/pid"
+      if [ "$HUSK_LINE" = "$$" ]; then
         HUSK_CLEAN_LOCK="$lock"
         return 0
       fi
       continue
     fi
-    pid=$(cat "$lock/pid" 2>/dev/null || echo "")
+    set_first_line "$lock/pid"; pid=$HUSK_LINE
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
       note "stealing stale lock (dead pid $pid): $lock"
       steal_lock "$lock" "$pid" || true
@@ -671,7 +734,10 @@ exit 0
 HUSK_WINFARM_EOF
 
   local wsrc wdst wps rc=1
-  if wsrc=$(cygpath -w "$1") && wdst=$(cygpath -w "$2") && wps=$(cygpath -w "$HUSK_WINFARM_PS"); then
+  set_win_path "$1"; wsrc=$HUSK_WP
+  set_win_path "$2"; wdst=$HUSK_WP
+  set_win_path "$HUSK_WINFARM_PS"; wps=$HUSK_WP
+  if [ -n "$wsrc" ] && [ -n "$wdst" ] && [ -n "$wps" ]; then
     powershell -NoProfile -ExecutionPolicy Bypass -File "$wps" -Src "$wsrc" -Dst "$wdst" >/dev/null 2>&1 && rc=0
   fi
   rm -f "$HUSK_WINFARM_PS" 2>/dev/null
@@ -727,8 +793,8 @@ make_junction() { # link entry -> 0 if a real directory junction now exists at $
   [ "${HUSK_JUNCTION:-1}" = "1" ] || return 1
   command -v cmd >/dev/null 2>&1 || return 1
   local wl we
-  wl=$(cygpath -w "$1") || return 1
-  we=$(cygpath -w "$2") || return 1
+  set_win_path "$1"; wl=$HUSK_WP; [ -n "$wl" ] || return 1
+  set_win_path "$2"; we=$HUSK_WP; [ -n "$we" ] || return 1
   cmd //c mklink //J "$wl" "$we" >/dev/null 2>&1 || return 1
   # trust nothing: a junction that did not actually resolve is worse than none
   [ -L "$1" ] && [ -d "$1" ]
@@ -865,7 +931,7 @@ compress_apply() { # tool dir -> 0 if the tool ran; says nothing about the resul
       # available, and it is why the probe insists on seeing blocks actually
       # drop rather than trusting an exit code.
       local w
-      w=$(cygpath -w "$2" 2>/dev/null) || return 1
+      set_win_path "$2"; w=$HUSK_WP; [ -n "$w" ] || return 1
       MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
         compact.exe /c /s:"$w" /i /q /exe:LZX >/dev/null 2>&1 || return 1 ;;
     btrfs)
@@ -1494,7 +1560,7 @@ cmd_add() {
   # overrides it, and 0 forces the probe every time.
   local stale stamp nowts last
   set_repo_common_dir; stamp="$HUSK_RCD/husk-reap-probe"
-  now_ts; nowts=$HUSK_NOW; last=$(cat "$stamp" 2>/dev/null || echo 0)
+  now_ts; nowts=$HUSK_NOW; set_first_line "$stamp"; last=$HUSK_LINE
   case "$last" in *[!0-9]*|"") last=0 ;; esac
   if [ $((nowts - last)) -ge "${HUSK_NUDGE_SECS:-86400}" ]; then
     printf '%s' "$nowts" > "$stamp" 2>/dev/null || true
@@ -1732,7 +1798,7 @@ cmd_doctor() {
   local lock pid
   for lock in "$base"/*/*.lock; do
     [ -d "$lock" ] || continue
-    pid=$(cat "$lock/pid" 2>/dev/null || echo "")
+    set_first_line "$lock/pid"; pid=$HUSK_LINE
     if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
       issues=$((issues+1))
       if [ $fix -eq 1 ]; then
@@ -1871,12 +1937,12 @@ cmd_gc() {
     # never touch an entry mid-seed (lock held) or younger than 10 minutes:
     # a sibling 'husk link' may have seeded it but not yet written its ref
     [ -d "$entry.lock" ] && continue
-    seeded=$(cat "$entry/.husk-seeded" 2>/dev/null || echo 0)
+    set_first_line "$entry/.husk-seeded"; seeded=${HUSK_LINE:-0}
     case "$seeded" in *[!0-9]*|"") seeded=0 ;; esac
     [ $((now - seeded)) -lt 600 ] && continue
     # ...or provisioned FROM recently: the consuming worktree's ref+state
     # land only after the copy finishes, so honor the in-use stamp too
-    used=$(cat "$entry.used" 2>/dev/null || echo 0)
+    set_first_line "$entry.used"; used=${HUSK_LINE:-0}
     case "$used" in *[!0-9]*|"") used=0 ;; esac
     [ $((now - used)) -lt 600 ] && continue
     refs="$entry.refs"
@@ -1909,9 +1975,9 @@ WTS
         # If gc dies mid-delete the dead-pid lock is stolen/swept later.
         mkdir "$entry.lock" 2>/dev/null || continue
         echo $$ > "$entry.lock/pid"
-        used=$(cat "$entry.used" 2>/dev/null || echo 0)
+        set_first_line "$entry.used"; used=${HUSK_LINE:-0}
         case "$used" in *[!0-9]*|"") used=0 ;; esac
-        seeded=$(cat "$entry/.husk-seeded" 2>/dev/null || echo 0)
+        set_first_line "$entry/.husk-seeded"; seeded=${HUSK_LINE:-0}
         case "$seeded" in *[!0-9]*|"") seeded=0 ;; esac
         now_ts; now=$HUSK_NOW
         if [ $((now - used)) -lt 600 ] || [ $((now - seeded)) -lt 600 ]; then

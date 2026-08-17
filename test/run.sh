@@ -362,6 +362,67 @@ else
   ok "skip: no powershell/cygpath here (native Win32 farm is Windows-only)"
 fi
 
+# set_win_path replaces `cygpath -w` with a shell rewrite for /<drive>/ paths,
+# which is worth ~340ms per call here. It is only allowed to be worth anything
+# if it agrees with cygpath EXACTLY, and this suite's own tmpdir sits under an
+# MSYS mount alias where the shortcut never fires -- so compare directly, on
+# paths chosen to include the cases that break a naive rewrite.
+if command -v cygpath >/dev/null 2>&1; then
+  # husk is a script with a dispatcher on its last line, so dropping that line
+  # leaves a sourceable library. Source it in a SUBSHELL: husk defines out/note/
+  # die, and this suite has its own, so sourcing it here would quietly replace
+  # the harness underneath the remaining tests.
+  sed '$ d' "$HUSK" > "$TMP/husk-lib.sh"
+  wp_out=$(
+    # shellcheck disable=SC1090
+    . "$TMP/husk-lib.sh"
+    HUSK_HAVE_CYGPATH=1
+    bad=""
+    for p in /c /c/Windows "/c/Program Files" /d/nope /tmp /usr/bin "$TMP" "$TMP/a b"; do
+      set_win_path "$p"
+      ref=$(cygpath -w "$p" 2>/dev/null)
+      [ "$HUSK_WP" = "$ref" ] || bad="$bad [$p: got '$HUSK_WP' want '$ref']"
+    done
+    printf 'shortcut=%s\nwver_c=%s\nbad=%s\n' \
+      "$HUSK_WIN_SHORTCUT" "${HUSK_WVER_C-unset}" "$bad"
+  )
+  assert "set_win_path agrees with cygpath on every shape" \
+    bash -c "printf '%s' \"\$1\" | grep -q '^bad=\$'" _ "$wp_out"
+  assert "set_win_path took the shell shortcut at least once" \
+    bash -c "printf '%s' \"\$1\" | grep -q '^shortcut=1\$'" _ "$wp_out"
+  # Trust is memoized per drive letter, not once per process: a custom fstab
+  # can map /x anywhere, and one global yes would let C: vouch for it.
+  assert "set_win_path records its verdict per drive letter" \
+    bash -c "printf '%s' \"\$1\" | grep -q '^wver_c=1\$'" _ "$wp_out"
+
+  # set_posix_path routes /<drive>/ paths through set_win_path now instead of
+  # paying `cygpath -m`. The property that must survive is the only one the
+  # function exists for: every spelling of a directory collapses to ONE answer.
+  # Feed it both the POSIX spelling and the Windows spelling of the same path
+  # and demand the same result -- that is exactly the store-namespace split the
+  # canonicalization prevents, tested without reimplementing it.
+  pp_out=$(
+    # shellcheck disable=SC1090
+    . "$TMP/husk-lib.sh"
+    HUSK_HAVE_CYGPATH=1
+    bad=""
+    for p in /c/Windows "/c/Program Files" /c/Projects /tmp /usr/bin "$TMP"; do
+      set_posix_path "$p"; a=$HUSK_PP
+      set_posix_path "$(cygpath -m "$p")"; b=$HUSK_PP
+      [ "$a" = "$b" ] || bad="$bad [$p: posix '$a' vs windows '$b']"
+      case "$a" in /[a-z]/*) ;; *) bad="$bad [$p: '$a' is not a drive path]" ;; esac
+    done
+    printf 'bad=%s\n' "$bad"
+  )
+  assert "set_posix_path collapses both spellings of a path to one" \
+    bash -c "printf '%s' \"\$1\" | grep -q '^bad=\$'" _ "$pp_out"
+else
+  ok "skip: no cygpath here (set_win_path is Windows-only)"
+  ok "skip: no cygpath here (set_win_path is Windows-only)"
+  ok "skip: no cygpath here (set_win_path is Windows-only)"
+  ok "skip: no cygpath here (set_posix_path round trip is Windows-only)"
+fi
+
 # store-inside-repo guard: refuse before any damage can happen
 assert_not "store inside repo is refused" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link"
 assert "guard names the problem" bash -c "cd '$TMP/repo' && HUSK_STORE='$TMP/repo/.mystore' '$HUSK' link 2>&1 | grep -q 'inside the repo'"
@@ -404,7 +465,15 @@ assert "stolen lock is gone" bash -c "[ ! -d '$pl_entry.lock' ]"
 # caught between its mkdir and its pid write, not an orphan. A stale-pid
 # stealer racing a fresh acquisition used to rm the winner's lock, letting
 # two processes hold it and lose state rows. Unit-level: call the function.
-sed -n '/^mtime_of()/,/^}/p; /^steal_lock()/,/^}/p' "$HUSK" > "$TMP/lockfns.sh"
+# Extract steal_lock and everything it calls. Miss a helper and the stub still
+# sources fine, then steal_lock silently takes the wrong branch on a
+# command-not-found -- which is how this test read a real regression into a
+# refactor that had not touched locking at all.
+sed -n '/^mtime_of()/,/^}/p; /^set_first_line()/,/^}/p; /^steal_lock()/,/^}/p' \
+  "$HUSK" > "$TMP/lockfns.sh"
+for fn in mtime_of set_first_line steal_lock; do
+  grep -q "^$fn()" "$TMP/lockfns.sh" || fail "lockfns stub is missing $fn"
+done
 mkdir "$TMP/fresh.lock"
 sl_rc=0
 ( . "$TMP/lockfns.sh"; steal_lock "$TMP/fresh.lock" 99999 ) >/dev/null 2>&1 || sl_rc=$?
