@@ -127,9 +127,12 @@ and compress hard; a tree of images or prebuilt binaries will barely move. Run
 
 ## Benchmarks
 
-10 worktrees of a real repo (395 MB `node_modules`, 14,700 files, warm npm cache),
-Apple Silicon, APFS. Disk is measured as real blocks consumed (`df` delta), not
-apparent size:
+Two platforms, two real repos, two different default modes. Disk is always the
+whole-volume delta (`df`), never apparent size, because a hardlink farm's
+apparent size is exactly the thing that lies.
+
+**macOS, APFS, `clone` mode.** 10 worktrees of a 395 MB `node_modules`, 14,700
+files, warm npm cache, Apple Silicon:
 
 | approach | wall time | disk consumed |
 |---|---|---|
@@ -140,47 +143,52 @@ apparent size:
 | `husk add` (copy mode) | 45.7s | 3,954 MB |
 | 10 **concurrent** `husk add` (agent-thread race) | 26.3s | 63 MB |
 
-Provisioning fans out per-package across cores (capped at 8 jobs), so the default
-path is faster than a warm-cache `npm ci` while consuming 66x less disk. Notes
-worth being honest about: `npm ci` at 2.7s per worktree is a best case (warm
-cache, fast SSD); cold caches or private registries make the baseline minutes,
-while husk's numbers don't change. Hardlink mode is bounded by `link(2)` speed on
-APFS; on ext4, where it's the default, links are much cheaper. The concurrent run
-produced 10/10 working worktrees with one store entry and no partial trees; wall
-time is bounded by git's own worktree lock, not by husk. Store dedupe across two
-lockfile versions: the second entry cost 21 MB instead of 395 MB. Reproduce with
-`test/run.sh` plus the commands above.
+**Windows, NTFS, `hardlink` mode.** 5 worktrees of a real 21,000-file, 449 MB
+`node_modules`, run by `test/bench-fleet.sh`:
 
-The table above is the APFS `clone`-mode best case. A second run on NTFS
-`hardlink` mode, against a real ~400 MB, ~22,000-file `node_modules` with total
-disk remeasured after every single `husk add`, puts the **marginal cost of each
-extra worktree at 6.70 MB against 405.01 MB**, a 60x saving, ahead from the second
-worktree onward. Totals including the store are 5.0x at ten worktrees, because the
-store holds one full copy; quote the marginal number or the total, but say which.
-That 6.70 MB is a whole-volume delta, not `du`: NTFS keeps small directories
-inside the MFT, so `du` over the same pair of trees reports 0.31 MB and is
-wrong about it. The volume delta is the number that describes your disk.
+| approach | 5 worktrees | each extra worktree | store on disk |
+|---|---|---|---|
+| `git worktree add` + `cp -R` | 2300.5 MB | 460.1 MB | n/a |
+| `husk add` | 476.5 MB | 5.0 MB | 451.0 MB |
+| `husk add` + `husk compress` | **86.6 MB** | 5.0 MB | **83.2 MB** |
 
-Compressing the store is measured separately, because it multiplies with the
-above rather than replacing it. Five worktrees on NTFS against the same real
-21,000-file `node_modules`: **2300.5 MB as plain worktrees, 476.5 MB with husk,
-86.6 MB with husk and a compressed store.** The store itself, the one full copy
-husk still pays for, goes from **451.0 MB to 83.2 MB**, which is 5.4x less disk
-for byte-identical content. Measured as `du` on the store, which counts blocks
-on the entry and does not care what else the volume is doing; the fleet totals
-are whole-volume deltas and are quoted as corroboration. Against apparent bytes
-the compression ratio is 4.9 to 1 (403.6 MB of content in 83.2 MB of disk); the
-on-disk saving is larger than the ratio because NTFS rounds 21,000 small files
-up to 4 KB clusters before compression and does not afterwards.
+That is 92x on the marginal worktree and 26.6x on the fleet total. The two
+savings are independent: sharing removes the copies, compression shrinks the one
+copy that is left, and the store number is what moves between the last two rows.
 
-The marginal cost of each extra worktree is unchanged by any of this, at about
-5 MB, because a hardlink farm costs directory metadata rather than file bytes.
-Reproduce both halves with `test/bench-fleet.sh --baseline` and `--after`.
+On time, the same Windows tree gives `husk add` at a 15.9s median against 19.7s
+for `git worktree add` + `cp -R`, alternated over five rounds. Windows used to
+be husk's slow platform and is not any more; the paragraph under Platforms
+explains what changed and why the number is quoted with its spread.
 
-That ratio is not a constant. It is roughly the tree's average bytes per file
-divided by the per-file directory overhead a hardlink farm still pays, about 310
-bytes per file on NTFS. Denser trees do better, and a tree of many tiny files does
-worse. Run `husk list` in your own repo for the number that applies to you.
+Reading these honestly:
+
+- **Quote the marginal number or the total, but say which.** husk is behind on
+  disk at one worktree, because the store holds a full copy, and ahead from the
+  second onward. The fleet ratio grows with the fleet.
+- **The ratio is not a constant.** For sharing it is roughly the tree's average
+  bytes per file over the ~310 bytes per file of directory overhead a hardlink
+  farm still pays on NTFS, so denser trees do better and many-tiny-file trees do
+  worse. For compression it is whatever your tree compresses to. Run `husk list`
+  and `husk compress` for the numbers that apply to you.
+- **Store size is measured with `du`, fleet totals with `df`.** `du` counts
+  blocks on the entry and cannot be perturbed by anything else on the volume,
+  which makes it the right instrument for the store. It is the wrong one for a
+  hardlink farm: NTFS keeps small directories in the MFT, and `du` over a pair
+  of worktrees reports 0.31 MB where the volume says 6.7 MB.
+- **`npm ci` at 2.7s per worktree is a best case** (warm cache, fast SSD). Cold
+  caches or a private registry make that baseline minutes; husk's numbers do not
+  move.
+- Clone mode beats a warm `npm ci` because provisioning fans out per top-level
+  package across cores, capped at 8 jobs. Hardlink mode is the slow row on APFS
+  because it is bounded by `link(2)`; on ext4, where it is the default, links
+  are far cheaper.
+- The concurrent run produced 10/10 working worktrees from one store entry with
+  no partial trees. Wall time there is bounded by git's own worktree lock, not
+  by husk.
+
+Reproduce with `test/run.sh`, `test/bench-fleet.sh --baseline` and
+`test/bench-fleet.sh --after`.
 
 ## Commands
 
@@ -235,12 +243,50 @@ changes behavior.
 
 ## Tradeoffs, honestly
 
-| axis | how husk handles it |
-|---|---|
-| **Correctness / isolation** | Store entries are keyed by lockfile hash, so a branch with a different lockfile can never silently get the wrong deps. Default `clone` mode gives fully private writes. A worktree whose lockfile changed is *refused* sharing until deps are reinstalled (`--install`) or explicitly trusted (`adopt`). |
-| **Concurrency / write contention** | Store seeding is serialized by a portable lock with atomic rename: 100 parallel `husk link` calls produce exactly one entry, and no partial tree is ever visible. The same lock serializes `--install`, so 100 agents hitting a fresh lockfile run **one** installer while 99 wait and reuse the result. Interrupted commands clean up after themselves (held locks and half-built temp dirs are released on exit), a killed process's lock is stolen once its pid is gone (steal is rename-then-verify, so two stealers can never wipe a lock a third process just took), and `husk doctor --fix` sweeps any residue that survives a hard kill. `gc` re-verifies under the entry lock before deleting, treats the repo's actual worktrees (not just ref files) as the source of truth for liveness, and never touches an entry that was seeded or provisioned from in the last 10 minutes. Provisioning from an existing entry is lock-free. In `symlink` mode the entry root is made read-only, so direct writes fail loudly (EACCES). An accidental `npm install` can't poison siblings either: npm replaces the symlink with a fresh private dir (correct results, sharing silently lost, and `husk status` flags it as `not-a-link`). |
-| **Tooling assumptions** | `clone`, `hardlink`, and `copy` produce real directories, and no tool can tell the difference. `symlink` mode has the classic realpath caveats (Node's `__dirname` resolves into the store; Docker build contexts can't follow it), which is why it's opt-in rather than the default. Python venvs are path-bound by design: symlink mode works, clone mode is flagged by `doctor`. If you use `uv` or a global-cache package manager (pnpm, Go modules), you already have most of this; husk adds the most for npm-style per-project dirs. |
-| **When it breaks** | Every failure degrades toward `copy`, which is always correct. Dangling link: `husk doctor --fix` re-provisions. Lockfile drift: `status` and `doctor` flag it, `link` re-keys, `unlink` goes private. Store deleted: worktrees re-seed from any checkout with real dirs. A store configured *inside* the repo is refused outright (deleting a worktree would destroy it). husk can never make a worktree *less* correct than a plain worktree, only cheaper. |
+**Correctness and isolation.** Store entries are keyed by lockfile hash, so a
+branch with a different lockfile can never silently get the wrong deps. Default
+`clone` mode gives fully private writes. A worktree whose lockfile changed is
+*refused* sharing until deps are reinstalled (`--install`) or explicitly trusted
+(`adopt`).
+
+**Concurrency.** This is the case husk is built for, so it is worth being
+specific:
+
+- Store seeding is serialized by a portable lock with atomic rename. 100
+  parallel `husk link` calls produce exactly one entry, and no partial tree is
+  ever visible.
+- The same lock serializes `--install`, so 100 agents hitting a fresh lockfile
+  run **one** installer while 99 wait and reuse the result.
+- Provisioning from an entry that already exists takes no lock at all.
+- Interrupted commands clean up after themselves: held locks and half-built temp
+  dirs are released on exit. A killed process's lock is stolen once its pid is
+  gone, and the steal is rename-then-verify, so two stealers can never wipe a
+  lock a third process just legitimately took. `husk doctor --fix` sweeps
+  whatever survives a hard kill.
+- `gc` re-verifies under the entry lock before deleting, treats the repo's
+  actual worktrees rather than ref files as the source of truth for liveness,
+  and never touches an entry seeded or provisioned from in the last 10 minutes.
+- In `symlink` mode the entry root is read-only, so a direct write fails loudly
+  with EACCES. An accidental `npm install` cannot poison siblings either: npm
+  replaces the symlink with a fresh private dir, which is correct but silently
+  unshared, and `husk status` flags it as `not-a-link`.
+
+**Tooling assumptions.** `clone`, `hardlink`, and `copy` produce real
+directories, and no tool can tell the difference. `symlink` mode has the classic
+realpath caveats (Node's `__dirname` resolves into the store, Docker build
+contexts cannot follow it), which is why it is opt-in rather than the default.
+Python venvs are path-bound by design: symlink mode works, clone mode is flagged
+by `doctor`. If you already use `uv` or a global-cache package manager (pnpm, Go
+modules), you have most of this; husk adds the most for npm-style per-project
+dirs.
+
+**When it breaks.** Every failure degrades toward `copy`, which is always
+correct. Dangling link: `husk doctor --fix` re-provisions. Lockfile drift:
+`status` and `doctor` flag it, `link` re-keys, `unlink` goes private. Store
+deleted: worktrees re-seed from any checkout with real dirs. A store configured
+*inside* the repo is refused outright, because deleting a worktree would destroy
+it. husk can never make a worktree *less* correct than a plain worktree, only
+cheaper.
 
 ## Stale worktree reaping
 
@@ -303,30 +349,37 @@ three only change how the same result is reached.
   store intact (checked against `rm -rf`, `git worktree remove`, and husk's
   own force-writable delete). Hardlink farming goes through a native
   `CreateHardLinkW` walk, which avoids MSYS path translation on every one of
-  a `node_modules`' 22,000 files; `HUSK_WINFARM=0` forces the portable
-  `cp -al` chain. Paths that native `git.exe` emits
+  a `node_modules`' tens of thousands of files; `HUSK_WINFARM=0` forces the
+  portable `cp -al` chain. Paths that native `git.exe` emits
   (`C:/...`) are normalized before being hashed or compared, so the store
   namespace is stable across the main checkout and its worktrees.
-  **On Windows, expect a big disk win and a smaller time loss.** Measured on
-  NTFS against the ~400 MB, ~22,000-file `node_modules` above: each extra
-  worktree costs **6.7 MB instead of 405 MB**, a 60x saving, and husk is ahead
-  on disk from the second worktree onward. On time it is still behind, but by
-  much less than it was: `husk add` is **55.6s against 33.8s** for
-  `git worktree add` + `cp -R`, median of three runs alternated against each
-  other in one session. It used to be 103s against 37s.
+  **On Windows, expect a big disk win and, as of this round, a time win too.**
+  The disk side is the NTFS table under Benchmarks, and husk is ahead there
+  from the second worktree onward. On time, `husk add` now runs at **15.9s
+  against 19.7s** for `git worktree add` + `cp -R` on the same 21,000-file,
+  449 MB tree: medians of five rounds alternated against each other in one
+  session, husk ahead in four of the five. It used to be 103s against 37s.
 
-  Where the remaining time goes is worth knowing before you read too much into
-  that ratio. A 10-file `node_modules` costs 45-51s on the same box and the
-  22,000-file one costs 55.6s, so almost all of it is **fixed cost, not tree
-  size**. It is process creation, which MSYS implements with a real Windows
-  process and Defender then inspects. That runs about 1.3s per process here.
-  Cutting the process count and caching what husk kept re-deriving took the
-  fixed part from 149s to under 50s, which is where most of the drop from 103s
-  to 55.6s came from.
-  The work helps on every platform; the size of the win does not transfer,
-  because no other platform charges anything like that per process.
+  Read that as a direction, not a point. The individual rounds were 13.4-23.2s
+  for husk and 19.3-21.6s for plain, and the reason for the difference in
+  spread is the reason husk wins at all. `cp -R` writes 449 MB every time, which
+  is steady, predictable work. husk writes metadata into a store the page cache
+  is already holding, so it is bound by **process creation** instead, and every
+  process on this platform is a real Windows process that Defender inspects.
+  That makes husk the noisier of the two and the faster one, and the gap widens
+  as a fleet grows, because plain repeats all 449 MB per worktree while husk
+  never does.
 
-  One-time `husk adopt` is ~250s on that tree. Machine state dominates
+  It also means the honest unit for optimizing husk on Windows is **processes
+  spawned per add, not seconds**. The process count is deterministic; the clock
+  on this box swings 40% between identical runs. `husk add` currently spawns 24
+  external processes on a 21,000-file tree, counted from a `bash -x` trace,
+  down from 29 before this round; the whole hardlink walk is one of the 24. The
+  count is what gets optimized and the clock is what confirms it, in that
+  order. The work helps on every platform, but the size of the win does not
+  transfer, because no other platform charges anything like this per process.
+
+  One-time `husk adopt` is ~93s on that tree. Machine state dominates
   everything here: one `cp -R` measured minutes after a full test suite came
   in at 355s against the same command's usual 30s, purely because Defender was
   still working through what the suite had written. Exclude your store
@@ -361,7 +414,7 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 131 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 135 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck --severity=warning bin/husk install.sh test/run.sh   # must stay clean
 ```
