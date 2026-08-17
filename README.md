@@ -91,11 +91,14 @@ reported as `compress=none` and the store is left alone.
 
 The saving compounds with sharing instead of competing with it. A hardlink farm
 points at the same file records as the store, so compressing one entry
-compresses every worktree provisioned from it, at no per-worktree cost. This is
-why husk beats moving the whole box to a compressing filesystem: that cuts the
-same bytes, but it cuts them N times, because ten worktrees still hold ten
-compressed copies. husk removes the N first and then compresses the one copy
-that is left, and the two multiply.
+compresses every worktree provisioned from it, at no per-worktree cost.
+
+That is the part moving to a compressing filesystem does not do for you.
+Compression alone shrinks each copy but leaves N of them: ten worktrees become
+ten compressed copies. husk collapses the N to one first, and compressing that
+one is what multiplies. If you already run a compressing volume you get the
+second half for free, and `husk compress` will have little left to find. On
+NTFS, where nothing is compressed by default, it is the whole difference.
 
 Every sharing mode inherits it: `hardlink` shares the file record, `clone`
 reflinks the compressed extents, and `symlink` reads the store directly.
@@ -358,7 +361,7 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 126 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 131 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck --severity=warning bin/husk install.sh test/run.sh   # must stay clean
 ```
