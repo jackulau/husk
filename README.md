@@ -78,6 +78,53 @@ file to its nearest sibling entry (hash and permissions matched, fully batched,
 no per-file forks). Measured on a 395 MB `node_modules` with one bumped package:
 the second entry costs about 20 MB, not 395 MB. Off switch: `HUSK_DEDUPE=0`.
 
+## Compressing the store
+
+A store entry is written once and only read afterwards, which is the one shape
+transparent filesystem compression is unambiguously safe for. `husk compress`
+hands the store to whatever compressor the filesystem already accepts: NTFS
+`compact /exe:LZX` on Windows, `chattr +c` on btrfs, `afsctool` on APFS if you
+have it installed. Nothing is bundled and nothing is inferred from `uname`. husk
+compresses a probe file inside the real store and keeps the answer only if the
+blocks actually drop *and* the bytes come back byte-identical; anything else is
+reported as `compress=none` and the store is left alone.
+
+The saving compounds with sharing instead of competing with it. A hardlink farm
+points at the same file records as the store, so compressing one entry
+compresses every worktree provisioned from it, at no per-worktree cost.
+
+That is the part moving to a compressing filesystem does not do for you.
+Compression alone shrinks each copy but leaves N of them: ten worktrees become
+ten compressed copies. husk collapses the N to one first, and compressing that
+one is what multiplies. If you already run a compressing volume you get the
+second half for free, and `husk compress` will have little left to find. On
+NTFS, where nothing is compressed by default, it is the whole difference.
+
+Every sharing mode inherits it: `hardlink` shares the file record, `clone`
+reflinks the compressed extents, and `symlink` reads the store directly.
+`copy` mode is the honest exception. A plain copy reads the logical bytes and
+writes them back out uncompressed, so a copy-mode worktree pays full price no
+matter what the store costs.
+
+```sh
+husk compress            # compress this repo's published entries, idempotent
+husk compress --probe    # just say which compressor works here
+husk compress --dry-run  # count what would be compressed, touch nothing
+```
+
+Compression is off the `husk add` path by default, because an add that stops to
+compress 450 MB is an add that got slower. `HUSK_COMPRESS=1` opts into
+compressing a new entry while it is still staged, before it is published, which
+costs the first add and nothing afterwards. `HUSK_COMPRESS=0` disables the
+feature and the probe entirely. An entry that is mid-write is reported as
+`locked=N` and left alone, never compressed underneath its writer, and that
+count is kept separate from `skipped=N`, which means an entry that had nothing
+left to gain.
+
+Ratios come from your tree, not from husk. Dependency trees are repetitive text
+and compress hard; a tree of images or prebuilt binaries will barely move. Run
+`husk compress` and read the ratio it prints for the number that applies to you.
+
 ## Benchmarks
 
 10 worktrees of a real repo (395 MB `node_modules`, 14,700 files, warm npm cache),
@@ -114,6 +161,22 @@ That 6.70 MB is a whole-volume delta, not `du`: NTFS keeps small directories
 inside the MFT, so `du` over the same pair of trees reports 0.31 MB and is
 wrong about it. The volume delta is the number that describes your disk.
 
+Compressing the store is measured separately, because it multiplies with the
+above rather than replacing it. Five worktrees on NTFS against the same real
+21,000-file `node_modules`: **2300.5 MB as plain worktrees, 476.5 MB with husk,
+86.6 MB with husk and a compressed store.** The store itself, the one full copy
+husk still pays for, goes from **451.0 MB to 83.2 MB**, which is 5.4x less disk
+for byte-identical content. Measured as `du` on the store, which counts blocks
+on the entry and does not care what else the volume is doing; the fleet totals
+are whole-volume deltas and are quoted as corroboration. Against apparent bytes
+the compression ratio is 4.9 to 1 (403.6 MB of content in 83.2 MB of disk); the
+on-disk saving is larger than the ratio because NTFS rounds 21,000 small files
+up to 4 KB clusters before compression and does not afterwards.
+
+The marginal cost of each extra worktree is unchanged by any of this, at about
+5 MB, because a hardlink farm costs directory metadata rather than file bytes.
+Reproduce both halves with `test/bench-fleet.sh --baseline` and `--after`.
+
 That ratio is not a constant. It is roughly the tree's average bytes per file
 divided by the per-file directory overhead a hardlink farm still pays, about 310
 bytes per file on NTFS. Denser trees do better, and a tree of many tiny files does
@@ -136,6 +199,9 @@ husk reap [--dry-run]        delete stale worktrees (clean + merged/gone + idle 
    --days N                  override the idle threshold for this run
 husk gc [--dry-run]          drop store entries no worktree references
 husk dedupe                  hardlink identical files across store entries
+husk compress                compress this repo's store entries in place (worktrees inherit it)
+   --probe                   report which compressor this filesystem accepts
+   --dry-run                 count what would be compressed, touch nothing
 husk version                 print the husk version
 ```
 
@@ -154,6 +220,7 @@ husk link --install          # installs correctly, seeds the store for siblings
 # fleet hygiene - no daemon, run whenever (husk add nudges you)
 husk reap                    # clean + merged + idle worktrees deleted
 husk gc                      # store entries nobody uses anymore
+husk compress                # shrink what survived; every worktree shrinks with it
 ```
 
 `husk setup --write` drops the equivalent of this into your `AGENTS.md` automatically:
@@ -198,6 +265,7 @@ HUSK_MODE=auto                # auto | clone | hardlink | symlink | copy
 HUSK_DIRS="node_modules"      # override auto-detection
 HUSK_REAP_DAYS=7              # reap idle threshold
 HUSK_DEDUPE=1                 # hardlink identical files across store entries at seed time
+HUSK_COMPRESS=auto            # auto (compress only when asked) | 1 (compress new entries) | 0 (off)
 HUSK_NUDGE_SECS=86400         # how often 'husk add' probes for stale worktrees
 HUSK_LOCK_TIMEOUT=120         # seconds to wait for an orphaned lock
 HUSK_LOCK_TIMEOUT_BUSY=3600   # seconds to wait for a lock whose holder is alive (e.g. an installer)
@@ -267,6 +335,13 @@ three only change how the same result is reached.
 husk never guesses the platform. Every mode is probed against the actual
 filesystems in play, and anything that fails a probe falls off the ladder.
 
+Store compression follows the same rule. NTFS gets `compact /exe:LZX`, btrfs
+gets `chattr +c`, APFS gets `afsctool` if you have installed it, and every other
+filesystem reports `compress=none` and is left untouched. ZFS compresses at the
+dataset level, which husk did not do and therefore does not claim. The probe
+runs against the real store path and is only believed if the blocks drop and the
+bytes come back identical.
+
 ## What husk is not
 
 - **Not a package manager.** It shares and clones what your installer produced; it
@@ -286,7 +361,7 @@ Everything lives in two files: `bin/husk` (the whole tool, one bash script) and
 `test/run.sh` (the whole test suite, plain assertions, no framework).
 
 ```sh
-./test/run.sh                       # 115 tests, ~60s, runs in a throwaway tmpdir
+./test/run.sh                       # 131 tests, ~60s, runs in a throwaway tmpdir
 HUSK_STRESS=1 ./test/run.sh         # + hostile-name / deep-nesting / big-tree stress section
 shellcheck --severity=warning bin/husk install.sh test/run.sh   # must stay clean
 ```
