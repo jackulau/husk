@@ -97,6 +97,12 @@ same bytes, but it cuts them N times, because ten worktrees still hold ten
 compressed copies. husk removes the N first and then compresses the one copy
 that is left, and the two multiply.
 
+Every sharing mode inherits it: `hardlink` shares the file record, `clone`
+reflinks the compressed extents, and `symlink` reads the store directly.
+`copy` mode is the honest exception. A plain copy reads the logical bytes and
+writes them back out uncompressed, so a copy-mode worktree pays full price no
+matter what the store costs.
+
 ```sh
 husk compress            # compress this repo's published entries, idempotent
 husk compress --probe    # just say which compressor works here
@@ -107,8 +113,10 @@ Compression is off the `husk add` path by default, because an add that stops to
 compress 450 MB is an add that got slower. `HUSK_COMPRESS=1` opts into
 compressing a new entry while it is still staged, before it is published, which
 costs the first add and nothing afterwards. `HUSK_COMPRESS=0` disables the
-feature and the probe entirely. Entries being written are skipped and counted,
-never compressed underneath their writer.
+feature and the probe entirely. An entry that is mid-write is reported as
+`locked=N` and left alone, never compressed underneath its writer, and that
+count is kept separate from `skipped=N`, which means an entry that had nothing
+left to gain.
 
 Ratios come from your tree, not from husk. Dependency trees are repetitive text
 and compress hard; a tree of images or prebuilt binaries will barely move. Run

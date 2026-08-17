@@ -1965,7 +1965,7 @@ compress_entry() { # entry -> 0 if it shrank, 1 otherwise; never destructive
 }
 
 cmd_compress() { # [--probe] [--dry-run]
-  local base dirp entry root probe=0 dry=0 n=0 skipped=0 lock
+  local base dirp entry root probe=0 dry=0 n=0 skipped=0 locked=0 lock
   while [ $# -gt 0 ]; do
     case "$1" in
       --probe)   probe=1 ;;
@@ -1985,8 +1985,8 @@ cmd_compress() { # [--probe] [--dry-run]
     esac
     return 0
   fi
-  [ "$HUSK_CTOOL" = none ] && { out "compressed=0"; out "skipped=0"; return 0; }
-  [ -d "$base" ] || { out "compressed=0"; out "skipped=0"; return 0; }
+  [ "$HUSK_CTOOL" = none ] && { out "compressed=0"; out "skipped=0"; out "locked=0"; return 0; }
+  [ -d "$base" ] || { out "compressed=0"; out "skipped=0"; out "locked=0"; return 0; }
 
   HUSK_CBEFORE=0; HUSK_CAFTER=0
   for dirp in "$base"/*; do
@@ -1996,14 +1996,20 @@ cmd_compress() { # [--probe] [--dry-run]
       case "$entry" in *.tmp.*|*.lock) continue ;; esac
       # An entry mid-seed is being WRITTEN, and compressing a tree under a
       # writer is how a good idea becomes a corrupt store. Its lock says so.
+      #
+      # Locked and skipped are counted apart on purpose. "Nothing to gain, this
+      # entry is already compressed" and "hands off, someone is writing here"
+      # are different facts, and a single number that means either is a number
+      # no test can assert on.
       lock="$entry.lock"
-      if [ -d "$lock" ]; then skipped=$((skipped + 1)); continue; fi
+      if [ -d "$lock" ]; then locked=$((locked + 1)); continue; fi
       if [ "$dry" = 1 ]; then n=$((n + 1)); continue; fi
       if compress_entry "$entry"; then n=$((n + 1)); else skipped=$((skipped + 1)); fi
     done
   done
   out "compressed=$n"
   out "skipped=$skipped"
+  out "locked=$locked"
   if [ "$dry" = 0 ] && [ "$HUSK_CBEFORE" -gt 0 ]; then
     out "physical_before_kb=$HUSK_CBEFORE"
     out "physical_after_kb=$HUSK_CAFTER"

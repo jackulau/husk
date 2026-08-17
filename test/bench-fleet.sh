@@ -11,6 +11,7 @@
 #
 #   bash test/bench-fleet.sh --self-test        # fast harness check, tiny fixture
 #   bash test/bench-fleet.sh --baseline [N]     # real run: N worktrees, both ways
+#   bash test/bench-fleet.sh --after [N]        # husk side only, anchored on store du
 #   bash test/bench-fleet.sh --compress-check   # husk compress shrinks the store
 #   bash test/bench-fleet.sh --inherit-check    # a worktree inherits that compression
 #   bash test/bench-fleet.sh --health           # doctor clean, no residue, contents intact
@@ -272,6 +273,80 @@ self_test() {
   say "self-test ok: $shared/$files files shared, noise floor $(printf '%s\n' "$o" | sed -n 's/^noise_floor_mb=//p') MB"
 }
 
+run_after() { # n -> the husk side only, with a compression-anchored report
+  # Deliberately does NOT re-measure the plain fleet. Compression cannot change
+  # what a plain worktree costs, and the plain phase is both the slowest part of
+  # the run and the largest single disturbance to the volume it is measuring.
+  # Compare against the plain number in baseline.txt, taken on this same box,
+  # fixture and method.
+  local n="$1" base free0 free_seed free2 seed_kb marginal_kb store_kb store_lkb
+  local noise noise_after total_files shared tool
+
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/husk-after.XXXXXX") || die "mktemp failed"
+  base="$WORK/repo"
+  export HUSK_STORE="$WORK/store"
+
+  make_repo "$base" "bench-lock-v1"
+  if [ -n "${HUSK_BENCH_FIXTURE:-}" ]; then
+    say "using real fixture: $HUSK_BENCH_FIXTURE"
+    cp -R "$HUSK_BENCH_FIXTURE" "$base/node_modules"
+  else
+    make_fat_fixture "$base/node_modules" 40 40
+  fi
+
+  settle
+  noise=$(noise_floor_kb "$WORK")
+  free0=$(vol_free_kb "$WORK")
+  say "husk: seeding worktree (store is cold)"
+  fleet_husk "$base" 1 1
+  settle
+  free_seed=$(vol_free_kb "$WORK")
+  seed_kb=$(consumed_kb "$free0" "$free_seed")
+  if [ "$n" -gt 1 ]; then
+    say "husk: $((n - 1)) more (store is warm)"
+    fleet_husk "$base" 2 "$n"
+  fi
+  settle
+  free2=$(vol_free_kb "$WORK")
+  marginal_kb=$(consumed_kb "$free_seed" "$free2")
+
+  store_kb=$(du -sk "$HUSK_STORE" 2>/dev/null | awk '{print $1}')
+  store_lkb=$(du -sk --apparent-size "$HUSK_STORE" 2>/dev/null | awk '{print $1}') || store_lkb=""
+  total_files=$(find "$base/../husk-1/node_modules" -type f 2>/dev/null | grep -c . || true)
+  shared=$(count_shared "$base/../husk-1/node_modules")
+  tool=$( cd "$base" && "$HUSK_BIN" compress --probe 2>/dev/null | sed -n 's/^compress=//p' )
+
+  # Measured again at the end. A volume that was quiet going in and busy coming
+  # out was not measuring husk for part of the run, and the report has to say so
+  # rather than let a contaminated delta pass as a result.
+  noise_after=$(noise_floor_kb "$WORK")
+
+  out "worktrees=$n"
+  out "compress_tool=${tool:-none}"
+  out "noise_floor_mb=$(mb "$noise")"
+  out "noise_floor_after_mb=$(mb "$noise_after")"
+  out "husk_seed_mb=$(mb "$seed_kb")"
+  [ "$n" -gt 1 ] && out "husk_marginal_per_worktree_mb=$(mb $(( marginal_kb / (n - 1) )))"
+  out "husk_total_mb=$(mb $(( seed_kb + marginal_kb )))"
+  out "store_physical_mb=$(mb "${store_kb:-0}")"
+  if [ -n "${store_lkb:-}" ]; then
+    out "store_logical_mb=$(mb "$store_lkb")"
+    [ "${store_kb:-0}" -gt 0 ] && \
+      out "store_compression_ratio=$(awk -v a="$store_lkb" -v b="$store_kb" 'BEGIN { printf "%.1f", a/b }')"
+  fi
+  out "worktree_files=${total_files:-0}"
+  out "worktree_files_shared=${shared:-0}"
+  # The store numbers come from du, which counts blocks on the entry itself and
+  # is unaffected by anything else happening on the volume. The volume deltas
+  # are the fragile ones, so flag them rather than quietly trusting them.
+  if [ "$noise_after" -gt "$noise" ] && [ "$noise_after" -gt $(( seed_kb / 20 )) ]; then
+    out "volume_quiet=no"
+    say "the volume was NOT quiet: treat the *_mb deltas as unmeasured, the store numbers still hold"
+  else
+    out "volume_quiet=yes"
+  fi
+}
+
 # ---------- compression checks ----------
 setup_compressible() { # -> $WORK/repo with a compressible node_modules, HUSK_STORE exported
   WORK=$(mktemp -d "${TMPDIR:-/tmp}/husk-cmp.XXXXXX") || die "mktemp failed"
@@ -426,6 +501,7 @@ main() {
   case "${1:---self-test}" in
     --self-test)      self_test ;;
     --baseline)       run_bench 40 40 "${2:-$BENCH_N}" ;;
+    --after)          run_after "${2:-$BENCH_N}" ;;
     --compress-check) compress_check ;;
     --inherit-check)  inherit_check ;;
     --health)         health_check ;;

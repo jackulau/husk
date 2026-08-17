@@ -692,7 +692,17 @@ if [ "$HAVE_COMPRESS" = 1 ] && [ -d "$cmp_dir" ]; then
     bash -c "cmp -s '$TMP/cmp-wt/node_modules/big/bundle.js' '$cmp_dir/big/bundle.js'"
   wt_kb=$(du -sk "$TMP/cmp-wt/node_modules" 2>/dev/null | awk '{print $1}')
   assert "worktree inherits the compressed footprint" test "${wt_kb:-999999}" -le "$cmp_kb_before"
+  # Risk register: compression must not change what happens when a worktree
+  # stops sharing. unlink copies OUT of a compressed entry, which is a read, and
+  # the private copy it leaves behind has to be both correct and writable.
+  ( cd "$TMP/cmp-wt" && "$HUSK" unlink node_modules >/dev/null 2>&1 )
+  assert "unlink from a compressed entry returns identical bytes" \
+    bash -c "cmp -s '$TMP/cmp-wt/node_modules/big/bundle.js' '$cmp_dir/big/bundle.js'"
+  assert "unlink from a compressed entry leaves a private writable copy" \
+    bash -c "printf 'edited\n' >> '$TMP/cmp-wt/node_modules/big/bundle.js' && ! cmp -s '$TMP/cmp-wt/node_modules/big/bundle.js' '$cmp_dir/big/bundle.js'"
 else
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
   ok "skip: no store compression on this filesystem (compress tests elsewhere)"
   ok "skip: no store compression on this filesystem (compress tests elsewhere)"
   ok "skip: no store compression on this filesystem (compress tests elsewhere)"
@@ -702,9 +712,11 @@ fi
 
 # an entry that is mid-seed is being WRITTEN; compressing under a writer is how
 # a good idea corrupts a store, so a locked entry must be skipped and counted
+assert "compress reports nothing locked when nothing is locked" \
+  bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -q '^locked=0'"
 mkdir -p "$cmp_dir.lock" 2>/dev/null
 assert "compress skips a locked entry" \
-  bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -qE '^skipped=[1-9]'"
+  bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -qE '^locked=[1-9]'"
 rmdir "$cmp_dir.lock" 2>/dev/null
 
 # the capability probe writes a scratch dir into the store; a hard kill mid-probe
