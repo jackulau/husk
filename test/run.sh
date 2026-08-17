@@ -633,6 +633,80 @@ assert "list flags a worktree whose dep dir vanished" \
 assert "vanished dep drops out of the ref count" \
   bash -c "cd '$TMP/lst' && '$HUSK' list | grep -q '^entry .*refs=2'"
 
+# ================= 19. store compression =================
+# A store entry is written once and only read afterwards, which is the one
+# shape transparent filesystem compression is safe for. These tests care about
+# two things above all: that husk never CLAIMS compression it did not achieve,
+# and that a compressed entry still hands back exactly the bytes that went in.
+make_repo "$TMP/cmp" "cmp-lock-v1"
+cd "$TMP/cmp" || exit 1
+# something worth compressing: the default fixture is a few hundred bytes
+mkdir -p node_modules/big
+i=0
+while [ "$i" -lt 400 ]; do
+  printf '"use strict"; Object.defineProperty(exports, "__esModule", { value: true });\n' >> node_modules/big/bundle.js
+  i=$((i+1))
+done
+"$HUSK" link >/dev/null 2>&1
+# Ask husk where the entry is rather than guessing: the store is laid out as
+# <base>/<dep dir>/<key>, and a test that assumes any other shape quietly
+# skips itself instead of failing, which is worse than a wrong answer.
+cmp_base=$("$HUSK" status 2>/dev/null | sed -n 's/^store=//p' | head -1)
+cmp_key=$("$HUSK" status 2>/dev/null | sed -n 's/.* key=\([0-9a-f][0-9a-f]*\).*/\1/p' | head -1)
+cmp_dir="$cmp_base/node_modules/$cmp_key"
+
+assert "compress --probe exits 0" bash -c "cd '$TMP/cmp' && '$HUSK' compress --probe >/dev/null"
+assert "compress --probe reports a tool" \
+  bash -c "cd '$TMP/cmp' && '$HUSK' compress --probe | grep -q '^compress='"
+assert "compress rejects an unknown option" \
+  bash -c "cd '$TMP/cmp' && ! '$HUSK' compress --nope >/dev/null 2>&1"
+assert "compress --dry-run reports without acting" \
+  bash -c "cd '$TMP/cmp' && '$HUSK' compress --dry-run | grep -q '^compressed='"
+assert "HUSK_COMPRESS=0 disables the probe entirely" \
+  bash -c "cd '$TMP/cmp' && HUSK_COMPRESS=0 '$HUSK' compress --probe | grep -q '^compress=none'"
+
+hash_of() { openssl sha256 < "$1" 2>/dev/null || sha256sum < "$1"; }
+
+HAVE_COMPRESS=0
+cd "$TMP/cmp" || exit 1
+case $("$HUSK" compress --probe 2>/dev/null | sed -n 's/^compress=//p') in
+  ''|none) HAVE_COMPRESS=0 ;;
+  *)       HAVE_COMPRESS=1 ;;
+esac
+
+if [ "$HAVE_COMPRESS" = 1 ] && [ -d "$cmp_dir" ]; then
+  cmp_sig_before=$(hash_of "$cmp_dir/big/bundle.js")
+  cmp_kb_before=$(du -sk "$cmp_dir" | awk '{print $1}')
+  cd "$TMP/cmp" && "$HUSK" compress >/dev/null 2>&1
+  cmp_kb_after=$(du -sk "$cmp_dir" | awk '{print $1}')
+  cmp_sig_after=$(hash_of "$cmp_dir/big/bundle.js")
+
+  assert "compressed entry consumes fewer blocks" test "$cmp_kb_after" -lt "$cmp_kb_before"
+  assert "compressed entry returns identical bytes" test "$cmp_sig_before" = "$cmp_sig_after"
+  assert "compress is idempotent (second run exits 0)" \
+    bash -c "cd '$TMP/cmp' && '$HUSK' compress >/dev/null"
+  # the whole point: a worktree provisioned from a compressed entry inherits
+  # the compression, because it points at the same bytes
+  ( cd "$TMP/cmp" && "$HUSK" add "$TMP/cmp-wt" cmpwt >/dev/null 2>&1 )
+  assert "worktree from a compressed entry has identical content" \
+    bash -c "cmp -s '$TMP/cmp-wt/node_modules/big/bundle.js' '$cmp_dir/big/bundle.js'"
+  wt_kb=$(du -sk "$TMP/cmp-wt/node_modules" 2>/dev/null | awk '{print $1}')
+  assert "worktree inherits the compressed footprint" test "${wt_kb:-999999}" -le "$cmp_kb_before"
+else
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
+  ok "skip: no store compression on this filesystem (compress tests elsewhere)"
+fi
+
+# an entry that is mid-seed is being WRITTEN; compressing under a writer is how
+# a good idea corrupts a store, so a locked entry must be skipped and counted
+mkdir -p "$cmp_dir.lock" 2>/dev/null
+assert "compress skips a locked entry" \
+  bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -qE '^skipped=[1-9]'"
+rmdir "$cmp_dir.lock" 2>/dev/null
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

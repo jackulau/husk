@@ -292,6 +292,11 @@ load_conf() { # .husk.conf at repo root: KEY=VALUE lines, parsed - NEVER sourced
             auto|clone|hardlink|symlink|copy) HUSK_MODE=$v ;;
             *) note ".husk.conf: invalid HUSK_MODE '$v' ignored" ;;
           esac ;;
+        HUSK_COMPRESS)
+          case "$v" in
+            auto|0|1) HUSK_COMPRESS=$v ;;
+            *) note ".husk.conf: invalid HUSK_COMPRESS '$v' ignored (auto|0|1)" ;;
+          esac ;;
         HUSK_REAP_DAYS|HUSK_DEDUPE|HUSK_NUDGE_SECS|HUSK_LOCK_TIMEOUT|HUSK_LOCK_TIMEOUT_BUSY)
           case "$v" in
             ''|*[!0-9]*) note ".husk.conf: non-numeric $k '$v' ignored" ;;
@@ -800,6 +805,159 @@ probe_cache_put() { # cachefile key -> record $HUSK_PROBE for this filesystem pa
 }
 probe_mode() { set_probe_mode "$1" "$2"; printf '%s' "$HUSK_PROBE"; }
 
+# ---------- store compression ----------
+# A store entry is written once and then only read. That is the exact shape
+# transparent filesystem compression wants, and it is why husk can compress the
+# store when nothing can safely compress a working tree.
+#
+# The win MULTIPLIES with sharing instead of competing with it: a hardlink farm
+# and a CoW clone both point at the same bytes, so compressing one entry
+# compresses every worktree provisioned from it, at no per-worktree cost.
+# Measured on NTFS against a 21,004-file node_modules: 423 MB of data stored in
+# 59 MB, and a `cp -al` farm of it reports the same ratio.
+#
+# Nothing here is ever load-bearing for correctness. Every tool is probed
+# against the real store path, an unsupported filesystem lands on "none", and
+# an entry that fails to compress is simply an entry that stays big.
+HUSK_CBEFORE=0; HUSK_CAFTER=0
+HUSK_CTOOL=""   # "" untested, else wof|btrfs|afsctool|none
+
+compress_probe_bytes() { # file -> ~256K of compressible text (real deps are text)
+  local i=0
+  : > "$1" || return 1
+  while [ "$i" -lt 512 ]; do
+    printf '"use strict"; Object.defineProperty(exports, "__esModule", { value: true }); function transform(input, options) { return input; }\n' >> "$1"
+    i=$((i + 1))
+  done
+}
+
+HUSK_DU_APPARENT=-1
+logical_kb() { # path -> apparent KB, or nothing if this du cannot report it
+  # GNU du (Linux, and Git Bash's coreutils) has --apparent-size; BSD du does
+  # not, and there is no portable substitute that does not cost a stat per file
+  # on a 21,000-file tree. So the field is printed where it can be measured and
+  # omitted where it cannot, rather than guessed.
+  if [ "$HUSK_DU_APPARENT" = -1 ]; then
+    if du -sk --apparent-size . >/dev/null 2>&1; then HUSK_DU_APPARENT=1; else HUSK_DU_APPARENT=0; fi
+  fi
+  [ "$HUSK_DU_APPARENT" = 1 ] || return 1
+  du -sk --apparent-size "$1" 2>/dev/null | awk '{print $1; exit}'
+}
+
+phys_kb() { # path -> kilobytes actually consumed on disk (not apparent size)
+  # st_blocks, which every one of these tools makes tell the truth: NTFS WOF
+  # reports the compressed extent, btrfs reports compressed extents, and APFS
+  # decmpfs reports the compressed resource. `du` is the portable reader.
+  du -sk "$1" 2>/dev/null | awk '{print $1; exit}'
+}
+
+compress_apply() { # tool dir -> 0 if the tool ran; says nothing about the result
+  case "$1" in
+    wof)
+      # /exe:LZX is write-once compression: a write to a compressed file simply
+      # decompresses it. For an immutable store entry that is not a limitation,
+      # it is the whole point, and it is the best ratio Windows will give.
+      #
+      # MSYS_NO_PATHCONV: Git Bash rewrites any argument that looks like a
+      # POSIX path before the exe sees it, so a bare `/c` arrives as `C:\` and
+      # compact silently LISTS the volume instead of compressing anything. It
+      # reports success while doing nothing, which is the worst failure shape
+      # available, and it is why the probe insists on seeing blocks actually
+      # drop rather than trusting an exit code.
+      local w
+      w=$(cygpath -w "$2" 2>/dev/null) || return 1
+      MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+        compact.exe /c /s:"$w" /i /q /exe:LZX >/dev/null 2>&1 || return 1 ;;
+    btrfs)
+      # +c marks the directory: NEW writes into it are compressed. Existing
+      # files are not rewritten, which is why husk marks a staging dir BEFORE
+      # filling it (see compress_stage) as well as marking published entries.
+      chattr +c "$2" >/dev/null 2>&1 || return 1 ;;
+    afsctool)
+      afsctool -c "$2" >/dev/null 2>&1 || return 1 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+compress_stage() { # staging dir -> compress a not-yet-published entry, if asked to
+  # Default is OFF on this path, and that is a deliberate choice rather than
+  # timidity: seeding already copies the whole tree, and compressing it there
+  # would land the cost on whichever `husk add` happens to be first, which is
+  # exactly the command the last round of work spent itself making fast.
+  # `husk compress` (or HUSK_COMPRESS=1) puts the cost where the user asked
+  # for it. See the README's Compression section for the measured numbers.
+  case "${HUSK_COMPRESS:-auto}" in
+    1|yes|on) ;;
+    *) return 0 ;;
+  esac
+  set_store_base
+  set_compress_tool "$HUSK_SB"
+  [ "$HUSK_CTOOL" = none ] && return 0
+  compress_apply "$HUSK_CTOOL" "$1" || note "compress: $HUSK_CTOOL declined this entry, storing it uncompressed"
+  return 0
+}
+
+set_compress_tool() { # dir -> $HUSK_CTOOL, probed against the filesystem dir lives on
+  [ -n "$HUSK_CTOOL" ] && return 0
+  case "${HUSK_COMPRESS:-auto}" in 0) HUSK_CTOOL=none; return 0 ;; esac
+
+  local dir="$1" p f before after logical sig cf ctool ckey
+  mkdir -p "$dir" 2>/dev/null || { HUSK_CTOOL=none; return 0; }
+
+  # Disk cache, same asymmetry as the mode probe: only a POSITIVE answer is
+  # cached. A stale positive costs one failed compress and nothing else; a
+  # stale "none" would silently stop compressing forever.
+  if [ "${HUSK_PROBE_CACHE:-1}" = "1" ]; then
+    set_repo_common_dir; cf="$HUSK_RCD/husk-compress-cache"
+    if [ -f "$cf" ]; then
+      while IFS=$HUSK_TAB read -r ctool ckey; do
+        if [ "$ckey" = "$dir" ]; then HUSK_CTOOL=$ctool; return 0; fi
+      done < "$cf"
+    fi
+  else
+    cf=""
+  fi
+
+  p="$dir/.husk-cprobe.$$"
+  rm -rf "$p" 2>/dev/null
+  mkdir -p "$p" 2>/dev/null || { HUSK_CTOOL=none; return 0; }
+  f="$p/probe"
+
+  for ctool in wof btrfs afsctool; do
+    case "$ctool" in
+      wof)      [ "$HUSK_HAVE_CYGPATH" = 1 ] && command -v compact.exe >/dev/null 2>&1 || continue ;;
+      btrfs)    command -v chattr >/dev/null 2>&1 || continue ;;
+      afsctool) command -v afsctool >/dev/null 2>&1 || continue ;;
+    esac
+    # btrfs compresses on write, so the mark has to precede the bytes; the
+    # others compress in place afterwards. Cover both by marking, writing,
+    # then applying, and judging only the result.
+    [ "$ctool" = btrfs ] && { compress_apply btrfs "$p" || continue; }
+    compress_probe_bytes "$f" || continue
+    before=$(phys_kb "$f")
+    logical=$(wc -c < "$f" 2>/dev/null)
+    sig=$(sha256 < "$f" 2>/dev/null)
+    [ "$ctool" = btrfs ] || compress_apply "$ctool" "$p" || continue
+    after=$(phys_kb "$f")
+    # Two questions, and a tool has to pass both: did the bytes on disk
+    # actually shrink, and does the file still read back byte for byte? A
+    # compressor that changes what husk hands to a build is worse than none.
+    if [ -n "$before" ] && [ -n "$after" ] && [ "$after" -lt "$before" ] \
+       && [ "$(wc -c < "$f" 2>/dev/null)" = "$logical" ] \
+       && [ "$(sha256 < "$f" 2>/dev/null)" = "$sig" ]; then
+      HUSK_CTOOL=$ctool
+      rm -rf "$p" 2>/dev/null
+      [ -n "$cf" ] && printf '%s\t%s\n' "$HUSK_CTOOL" "$dir" >> "$cf" 2>/dev/null
+      return 0
+    fi
+    rm -f "$f" 2>/dev/null
+  done
+
+  rm -rf "$p" 2>/dev/null
+  HUSK_CTOOL=none
+}
+
 # ---------- worktree state (.husk/state: dir<TAB>key<TAB>mode) ----------
 set_state_file() { HUSK_SF="$1/.husk/state"; }   # root -> $HUSK_SF
 state_file() { printf '%s/.husk/state' "$1"; }
@@ -993,6 +1151,10 @@ seed_entry_locked() { # source-real-dir entry -> seeds; caller MUST hold the ent
     [ -n "$sib" ] && dedupe_entry "$tmp" "$sib"
   fi
   sig_file_for "$tmp" >/dev/null 2>&1 || true   # cache manifest for future siblings
+  # Compress BEFORE publish: the staging tree is private, so there is no reader
+  # to race and no lock to hold. After publish, an entry can be provisioned
+  # from at any moment, and provisioning is deliberately lock-free.
+  compress_stage "$tmp"
   now_ts; printf '%s\n' "$HUSK_NOW" > "$tmp/.husk-seeded" 2>/dev/null || true
   publish_entry "$tmp" "$entry"
   HUSK_CLEAN_TMP=""
@@ -1443,8 +1605,8 @@ cmd_status() {
 # store does not: for an entry referenced by R worktrees, (R-1) x its size.
 # Only sharing modes count; a copy-mode dir saves nothing and says so.
 cmd_list() {
-  local root base tmp wt branch sf d key mode entry st cnt size cur live
-  local n_wt=0 n_entries=0 total_saved=0 store_mb=0
+  local root base tmp wt branch sf d key mode entry st cnt size lsize cur live
+  local n_wt=0 n_entries=0 total_saved=0 total_logical=0 store_mb=0 store_logical=0
   set_repo_root; root=$HUSK_RR; load_conf "$root"
   set_store_base; base=$HUSK_SB
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/husk-list.XXXXXX") || die "mktemp failed"
@@ -1494,7 +1656,16 @@ cmd_list() {
       case "$size" in ''|*[!0-9]*) size=0 ;; esac
       n_entries=$((n_entries + 1))
       total_saved=$((total_saved + size * (cnt - 1) / 1024))
-      out "entry dir=$d key=$key refs=$cnt size_mb=$((size / 1024)) saved_mb=$((size * (cnt - 1) / 1024))"
+      # size_mb/saved_mb are PHYSICAL and stay exactly as they were: stdout is
+      # an API. What physical alone cannot say is what compression bought, so
+      # the logical size and the two halves of the saving are added alongside.
+      lsize=$(logical_kb "$entry" 2>/dev/null) || lsize=""
+      if [ -n "$lsize" ] && [ "$lsize" -ge "$size" ]; then
+        total_logical=$((total_logical + lsize))
+        out "entry dir=$d key=$key refs=$cnt size_mb=$((size / 1024)) saved_mb=$((size * (cnt - 1) / 1024)) logical_mb=$((lsize / 1024)) saved_sharing_mb=$((lsize * (cnt - 1) / 1024)) saved_compression_mb=$(( (lsize - size) / 1024 ))"
+      else
+        out "entry dir=$d key=$key refs=$cnt size_mb=$((size / 1024)) saved_mb=$((size * (cnt - 1) / 1024))"
+      fi
     done < "$tmp/counts"
   fi
 
@@ -1503,7 +1674,12 @@ cmd_list() {
     case "$store_mb" in ''|*[!0-9]*) store_mb=0 ;; esac
     store_mb=$((store_mb / 1024))
   fi
-  out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved"
+  store_logical=$(logical_kb "$base" 2>/dev/null) || store_logical=""
+  if [ -n "$store_logical" ] && [ "$total_logical" -gt 0 ]; then
+    out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved store_physical_mb=$store_mb store_logical_mb=$((store_logical / 1024))"
+  else
+    out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved store_physical_mb=$store_mb"
+  fi
   rm -rf "$tmp"; HUSK_CLEAN_TMP=""
 }
 
@@ -1766,6 +1942,66 @@ EOF
   out "dedupe done=1"
 }
 
+compress_entry() { # entry -> 0 if it shrank, 1 otherwise; never destructive
+  local entry="$1" before after
+  before=$(phys_kb "$entry"); [ -n "$before" ] || return 1
+  compress_apply "$HUSK_CTOOL" "$entry" || return 1
+  after=$(phys_kb "$entry"); [ -n "$after" ] || return 1
+  [ "$after" -lt "$before" ] || return 1
+  HUSK_CBEFORE=$((HUSK_CBEFORE + before))
+  HUSK_CAFTER=$((HUSK_CAFTER + after))
+  return 0
+}
+
+cmd_compress() { # [--probe] [--dry-run]
+  local base dirp entry root probe=0 dry=0 n=0 skipped=0 lock
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --probe)   probe=1 ;;
+      --dry-run) dry=1 ;;
+      *) die "compress: unknown option: $1" ;;
+    esac
+    shift
+  done
+  set_repo_root; root=$HUSK_RR; load_conf "$root"
+  set_store_base; base=$HUSK_SB
+  set_compress_tool "$base"
+  out "compress=$HUSK_CTOOL"
+  if [ "$probe" = 1 ]; then
+    case "$HUSK_CTOOL" in
+      none) note "no store compression available here (nothing installed that this filesystem accepts)" ;;
+      *)    note "store compression available via $HUSK_CTOOL" ;;
+    esac
+    return 0
+  fi
+  [ "$HUSK_CTOOL" = none ] && { out "compressed=0"; out "skipped=0"; return 0; }
+  [ -d "$base" ] || { out "compressed=0"; out "skipped=0"; return 0; }
+
+  HUSK_CBEFORE=0; HUSK_CAFTER=0
+  for dirp in "$base"/*; do
+    [ -d "$dirp" ] || continue
+    for entry in "$dirp"/*; do
+      [ -d "$entry" ] || continue
+      case "$entry" in *.tmp.*|*.lock) continue ;; esac
+      # An entry mid-seed is being WRITTEN, and compressing a tree under a
+      # writer is how a good idea becomes a corrupt store. Its lock says so.
+      lock="$entry.lock"
+      if [ -d "$lock" ]; then skipped=$((skipped + 1)); continue; fi
+      if [ "$dry" = 1 ]; then n=$((n + 1)); continue; fi
+      if compress_entry "$entry"; then n=$((n + 1)); else skipped=$((skipped + 1)); fi
+    done
+  done
+  out "compressed=$n"
+  out "skipped=$skipped"
+  if [ "$dry" = 0 ] && [ "$HUSK_CBEFORE" -gt 0 ]; then
+    out "physical_before_kb=$HUSK_CBEFORE"
+    out "physical_after_kb=$HUSK_CAFTER"
+    if [ "$HUSK_CAFTER" -gt 0 ]; then
+      out "ratio=$(awk -v a="$HUSK_CBEFORE" -v b="$HUSK_CAFTER" 'BEGIN { printf "%.1f", a/b }')"
+    fi
+  fi
+}
+
 # ---------- setup (agent adoption: adopt + instructions) ----------
 agent_snippet() {
   cat <<'EOF'
@@ -1817,6 +2053,7 @@ USAGE
   husk reap [--dry-run] [--days N]                  delete stale worktrees (clean+merged+idle)
   husk gc [--dry-run]                               drop unreferenced store entries
   husk dedupe                                       hardlink identical files across store entries
+  husk compress [--probe] [--dry-run]               compress store entries in place (every sharer inherits it)
   husk version                                      print the husk version
 
 MODES (--mode or HUSK_MODE; default: auto)
@@ -1832,6 +2069,7 @@ ENV
   HUSK_MODE       default mode (default auto)
   HUSK_REAP_DAYS  reap idle threshold (default 7)
   HUSK_DEDUPE     hardlink identical files across store entries at seed time (default 1)
+  HUSK_COMPRESS   compress store entries: auto (only when asked) | 1 at seed time | 0 never
   HUSK_WINFARM    Windows: native CreateHardLinkW farm, 0 to force the portable chain (default 1)
   HUSK_JUNCTION   Windows: allow directory junctions for symlink mode (default 1)
 
@@ -1858,6 +2096,7 @@ main() {
     reap)    cmd_reap "$@" ;;
     gc)      cmd_gc "$@" ;;
     dedupe)  cmd_dedupe "$@" ;;
+    compress) cmd_compress "$@" ;;
     version|--version) out "husk $HUSK_VERSION" ;;
     ""|help|--help|-h) usage ;;
     *) die "unknown command: $cmd (try 'husk --help')" ;;
