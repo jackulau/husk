@@ -1606,7 +1606,7 @@ cmd_status() {
 # Only sharing modes count; a copy-mode dir saves nothing and says so.
 cmd_list() {
   local root base tmp wt branch sf d key mode entry st cnt size lsize cur live
-  local n_wt=0 n_entries=0 total_saved=0 total_logical=0 store_mb=0 store_logical=0
+  local n_wt=0 n_entries=0 total_saved=0 total_logical=0 store_mb=0 store_kb=0 store_logical=0
   set_repo_root; root=$HUSK_RR; load_conf "$root"
   set_store_base; base=$HUSK_SB
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/husk-list.XXXXXX") || die "mktemp failed"
@@ -1670,15 +1670,26 @@ cmd_list() {
   fi
 
   if [ -d "$base" ]; then
-    store_mb=$(du -sk "$base" 2>/dev/null | cut -f1)
-    case "$store_mb" in ''|*[!0-9]*) store_mb=0 ;; esac
-    store_mb=$((store_mb / 1024))
+    store_kb=$(du -sk "$base" 2>/dev/null | cut -f1)
+    case "$store_kb" in ''|*[!0-9]*) store_kb=0 ;; esac
+    store_mb=$((store_kb / 1024))
   fi
   store_logical=$(logical_kb "$base" 2>/dev/null) || store_logical=""
   if [ -n "$store_logical" ] && [ "$total_logical" -gt 0 ]; then
     out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved store_physical_mb=$store_mb store_logical_mb=$((store_logical / 1024))"
   else
     out "summary worktrees=$n_wt entries=$n_entries store_mb=$store_mb saved_mb=$total_saved store_physical_mb=$store_mb"
+  fi
+  # Discoverability, not nagging. A store whose logical and physical sizes are
+  # the same has never been compressed, and on a filesystem that accepts a
+  # compressor that is several times its size left on the disk. Say it once, on
+  # stderr, where it cannot disturb the stdout API, and only for a store big
+  # enough for the advice to be worth acting on.
+  if [ -n "$store_logical" ] && [ "$store_kb" -gt 20480 ] \
+     && [ "$store_logical" -lt $((store_kb + store_kb / 5)) ]; then
+    set_compress_tool "$base"
+    [ "$HUSK_CTOOL" = none ] || \
+      note "store is uncompressed: 'husk compress' shrinks it in place (via $HUSK_CTOOL), and every worktree sharing it shrinks with it"
   fi
   rm -rf "$tmp"; HUSK_CLEAN_TMP=""
 }
@@ -1734,8 +1745,8 @@ cmd_doctor() {
   # replace (worktree), or live-dedupe swap (store, .husk-dd files).
   # The pid is baked into the name; skip residue whose owner is still running.
   local tmpd
-  for tmpd in "$base"/*/*.tmp.* "$root"/*.husk-tmp.* "$root"/*.husk-old.* \
-              "$root"/../*.husk-pre.*; do
+  for tmpd in "$base"/*/*.tmp.* "$base"/.husk-cprobe.* "$root"/*.husk-tmp.* \
+              "$root"/*.husk-old.* "$root"/../*.husk-pre.*; do
     [ -e "$tmpd" ] || [ -L "$tmpd" ] || continue
     pid=${tmpd##*.}
     case "$pid" in *[!0-9]*|'') pid="" ;; esac

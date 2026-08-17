@@ -707,6 +707,14 @@ assert "compress skips a locked entry" \
   bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -qE '^skipped=[1-9]'"
 rmdir "$cmp_dir.lock" 2>/dev/null
 
+# the capability probe writes a scratch dir into the store; a hard kill mid-probe
+# would leave it behind, so doctor has to know about it like every other residue
+mkdir -p "$cmp_base/.husk-cprobe.99999999"
+assert "doctor flags an orphaned compression probe" \
+  bash -c "cd '$TMP/cmp' && '$HUSK' doctor | grep -q 'tmp-residue.*husk-cprobe'"
+assert "doctor --fix removes the orphaned probe" \
+  bash -c "cd '$TMP/cmp' && '$HUSK' doctor --fix >/dev/null 2>&1; [ ! -d '$cmp_base/.husk-cprobe.99999999' ]"
+
 # ================= summary =================
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
