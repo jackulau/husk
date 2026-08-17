@@ -65,6 +65,11 @@ mb() { # kb -> MB, one decimal, no bc
   awk -v k="$1" 'BEGIN { printf "%.1f", k/1024 }'
 }
 
+delta_mb() { # kb noise_kb [divisor] -> MB, or "unmeasured" if the delta is inside the noise
+  local kb="$1" noise="$2" div="${3:-1}"
+  if [ "$kb" -le "$noise" ]; then printf 'unmeasured'; else mb $(( kb / div )); fi
+}
+
 # ---------- fixture ----------
 make_fixture() { # dir pkgs files_per_pkg -> a node_modules-shaped tree of JS-ish text
   local root="$1" pkgs="$2" per="$3" p f d
@@ -325,9 +330,12 @@ run_after() { # n -> the husk side only, with a compression-anchored report
   out "compress_tool=${tool:-none}"
   out "noise_floor_mb=$(mb "$noise")"
   out "noise_floor_after_mb=$(mb "$noise_after")"
-  out "husk_seed_mb=$(mb "$seed_kb")"
-  [ "$n" -gt 1 ] && out "husk_marginal_per_worktree_mb=$(mb $(( marginal_kb / (n - 1) )))"
-  out "husk_total_mb=$(mb $(( seed_kb + marginal_kb )))"
+  # A delta smaller than the volume's own drift is not a small measurement, it
+  # is no measurement. A NEGATIVE one is proof of that: free space went up while
+  # husk was writing. Print the word, not a number that reads like a result.
+  out "husk_seed_mb=$(delta_mb "$seed_kb" "$noise")"
+  [ "$n" -gt 1 ] && out "husk_marginal_per_worktree_mb=$(delta_mb "$marginal_kb" "$noise" "$((n - 1))")"
+  out "husk_total_mb=$(delta_mb $(( seed_kb + marginal_kb )) "$noise")"
   out "store_physical_mb=$(mb "${store_kb:-0}")"
   if [ -n "${store_lkb:-}" ]; then
     out "store_logical_mb=$(mb "$store_lkb")"

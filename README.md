@@ -158,6 +158,22 @@ That 6.70 MB is a whole-volume delta, not `du`: NTFS keeps small directories
 inside the MFT, so `du` over the same pair of trees reports 0.31 MB and is
 wrong about it. The volume delta is the number that describes your disk.
 
+Compressing the store is measured separately, because it multiplies with the
+above rather than replacing it. Five worktrees on NTFS against the same real
+21,000-file `node_modules`: **2300.5 MB as plain worktrees, 476.5 MB with husk,
+86.6 MB with husk and a compressed store.** The store itself, the one full copy
+husk still pays for, goes from **451.0 MB to 83.2 MB**, which is 5.4x less disk
+for byte-identical content. Measured as `du` on the store, which counts blocks
+on the entry and does not care what else the volume is doing; the fleet totals
+are whole-volume deltas and are quoted as corroboration. Against apparent bytes
+the compression ratio is 4.9 to 1 (403.6 MB of content in 83.2 MB of disk); the
+on-disk saving is larger than the ratio because NTFS rounds 21,000 small files
+up to 4 KB clusters before compression and does not afterwards.
+
+The marginal cost of each extra worktree is unchanged by any of this, at about
+5 MB, because a hardlink farm costs directory metadata rather than file bytes.
+Reproduce both halves with `test/bench-fleet.sh --baseline` and `--after`.
+
 That ratio is not a constant. It is roughly the tree's average bytes per file
 divided by the per-file directory overhead a hardlink farm still pays, about 310
 bytes per file on NTFS. Denser trees do better, and a tree of many tiny files does
