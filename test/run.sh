@@ -410,7 +410,9 @@ if command -v cygpath >/dev/null 2>&1; then
       set_posix_path "$p"; a=$HUSK_PP
       set_posix_path "$(cygpath -m "$p")"; b=$HUSK_PP
       [ "$a" = "$b" ] || bad="$bad [$p: posix '$a' vs windows '$b']"
-      case "$a" in /[a-z]/*) ;; *) bad="$bad [$p: '$a' is not a drive path]" ;; esac
+      # leading ( on patterns: bash 3.2 cannot parse a bare `pat)` case inside
+      # $(...) command substitution (macOS ships 3.2; parse error, not runtime)
+      case "$a" in (/[a-z]/*) ;; (*) bad="$bad [$p: '$a' is not a drive path]" ;; esac
     done
     printf 'bad=%s\n' "$bad"
   )
@@ -783,10 +785,16 @@ fi
 # a good idea corrupts a store, so a locked entry must be skipped and counted
 assert "compress reports nothing locked when nothing is locked" \
   bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -q '^locked=0'"
-mkdir -p "$cmp_dir.lock" 2>/dev/null
-assert "compress skips a locked entry" \
-  bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -qE '^locked=[1-9]'"
-rmdir "$cmp_dir.lock" 2>/dev/null
+if [ "$HAVE_COMPRESS" = 1 ]; then
+  # with no compression tool, cmd_compress returns before walking entries and
+  # correctly reports locked=0 -- there is no locked count to assert on
+  mkdir -p "$cmp_dir.lock" 2>/dev/null
+  assert "compress skips a locked entry" \
+    bash -c "cd '$TMP/cmp' && '$HUSK' compress | grep -qE '^locked=[1-9]'"
+  rmdir "$cmp_dir.lock" 2>/dev/null
+else
+  ok "skip: no store compression here (locked-entry skip needs the entry walk)"
+fi
 
 # the capability probe writes a scratch dir into the store; a hard kill mid-probe
 # would leave it behind, so doctor has to know about it like every other residue
