@@ -612,29 +612,43 @@ rm_rf_safe() { # dir -> remove even when copies inherited a read-only root (mode
   rm -rf "$1"
 }
 
-par_fanout() { # src dst clone|copy -> parallel per-top-level-entry copy across cores
-  local src="$1" dst="$2" op="$3" j
+par_fanout() { # src dst -> parallel per-top-level-entry copy across cores
+  local src="$1" dst="$2" j
   j=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
   [ "$j" -gt 8 ] && j=8
   case "$dst" in /*) ;; *) dst="$(pwd)/$dst" ;; esac
   mkdir "$dst" 2>/dev/null || return 1
-  if [ "$op" = clone ]; then
-    ( cd "$src" && find . -mindepth 1 -maxdepth 1 -print0 \
-      | xargs -0 -P "$j" -n 20 sh -c 'exec cp -c -R "$@" "$0/"' "$dst" ) 2>/dev/null && return 0
-  else
-    ( cd "$src" && find . -mindepth 1 -maxdepth 1 -print0 \
-      | xargs -0 -P "$j" -n 20 sh -c 'exec cp -Rp "$@" "$0/"' "$dst" ) 2>/dev/null && return 0
-  fi
+  ( cd "$src" && find . -mindepth 1 -maxdepth 1 -print0 \
+    | xargs -0 -P "$j" -n 20 sh -c 'exec cp -Rp "$@" "$0/"' "$dst" ) 2>/dev/null && return 0
   rm_rf_safe "$dst"; return 1
 }
 
+apfs_clone() { # src dst -> whole-hierarchy clonefile(2): one syscall clones the
+  # entire subtree (~0.1s for 14k files vs ~1.7s for a per-file cp -c walk).
+  # Darwin-only: 462 is clonefileat there; the same number on another kernel
+  # would invoke a different, unknown syscall.
+  [ "$(uname -s)" = Darwin ] || return 1
+  command -v perl >/dev/null 2>&1 || return 1
+  if perl -e 'my ($s, $d) = @ARGV; my $fdcwd = -2;
+              exit(syscall(462, $fdcwd, $s, $fdcwd, $d, 0) ? 1 : 0)' "$1" "$2" 2>/dev/null
+  then return 0; fi
+  rm_rf_safe "$2"   # a failed clonefile may leave a partially cloned hierarchy
+  return 1
+}
+
 cow_clone() { # src dst -> 0 if CoW clone succeeded; never leaves a partial dst
-  if [ -d "$1" ] && par_fanout "$1" "$2" clone; then return 0; fi     # macOS APFS, fanned out
-  if cp -c -R "$1" "$2" 2>/dev/null; then return 0; fi                # macOS serial (files, edge cases)
+  if apfs_clone "$1" "$2"; then cow_unguard "$2"; return 0; fi        # macOS APFS, one syscall
+  if cp -c -R "$1" "$2" 2>/dev/null; then cow_unguard "$2"; return 0; fi  # macOS per-file (no perl, edge cases)
   rm_rf_safe "$2"
-  if cp -R --reflink=always "$1" "$2" 2>/dev/null; then return 0; fi  # btrfs/xfs
+  if cp -R --reflink=always "$1" "$2" 2>/dev/null; then cow_unguard "$2"; return 0; fi  # btrfs/xfs
   rm_rf_safe "$2"           # GNU cp fails per-file AFTER creating dirs (with source
   return 1                  # modes, possibly read-only); residue would jam every fallback
+}
+
+cow_unguard() { # dst -> clones preserve the source root's mode, so a clone of a
+  # write-guarded store entry arrives read-only and strip_meta's rm silently
+  # fails, leaking .husk-manifest into the worktree. A clone is private: unguard.
+  chmod u+w "$1" 2>/dev/null || true
 }
 
 win_farm() { # src dst -> 0 on success, 1 to fall through to the portable chain
@@ -801,7 +815,7 @@ make_junction() { # link entry -> 0 if a real directory junction now exists at $
 }
 
 plain_copy() { # src dst -> dst must not pre-exist (partial dst is removed, see cow_clone)
-  if [ -d "$1" ] && par_fanout "$1" "$2" copy; then return 0; fi
+  if [ -d "$1" ] && par_fanout "$1" "$2"; then return 0; fi
   rm_rf_safe "$2"
   cp -Rp "$1" "$2" || { rm_rf_safe "$2"; return 1; }
   chmod u+w "$2" 2>/dev/null || true   # source root may be write-guarded; a copy is private
